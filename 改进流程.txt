@@ -1,0 +1,86 @@
+DualR-Enhanced: 双重推理增强的知识图谱问答框架
+====================================================
+
+核心创新点：
+1. 多模态图表示融合 (Multi-Modal Graph Representation Fusion)
+2. 渐进式注意力剪枝 (Progressive Attention Pruning)  
+3. 结构化多选提示生成 (Structured Multi-Choice Prompt Generation)
+4. 自适应图-文本对齐 (Adaptive Graph-Text Alignment)
+
+详细流程：
+
+阶段1: 渐进式图探索 (Progressive Graph Exploration)
+--------------------------------------------------
+1.1 初始化：从主题实体集合开始
+1.2 多层级扩展：
+   - 第1跳：保留top-5边（关键邻居发现）
+   - 第2跳：保留top-4边（语义扩展）
+   - 第3跳：保留top-3边（精确定位）
+1.3 动态剪枝策略：
+   - 注意力分数 α_attention
+   - 语义相似度 α_semantic  
+   - 自适应权重 λ = f(layer, performance)
+   - 融合分数：α_final = λ * α_attention + (1-λ) * α_semantic
+
+阶段2: 多模态表示生成 (Multi-Modal Representation Generation)
+----------------------------------------------------------
+2.1 结构化图表示：
+   - GNN编码：h_nodes = GNN_φ1(V, E, X)
+   - 全局池化：h_g = POOL(h_nodes) ∈ R^d_g
+   - 投影对齐：ĥ_g = MLP_φ2(h_g) ∈ R^d_llm
+
+2.2 文本化图表示：
+   - 路径文本化：textualize(paths) = "实体1 -关系1-> 实体2 -关系2-> 实体3"
+   - 候选答案格式化：format_candidates(candidates, scores, paths)
+   - 文本编码：h_t = TextEncoder([textualize(subgraph); question]) ∈ R^L×d_llm
+
+2.3 多选提示增强：
+   - 置信度排序：sort_by_confidence(candidates, scores)
+   - 推理路径验证：validate_reasoning_paths(paths)
+   - 结构化提示：construct_multi_choice_prompt(question, candidates, paths)
+
+阶段3: 自适应融合与生成 (Adaptive Fusion and Generation)
+-----------------------------------------------------
+3.1 注意力门控融合：
+   - 门控权重：g = sigmoid(W_g[ĥ_g; h_t] + b_g)
+   - 融合表示：h_fused = g ⊙ ĥ_g + (1-g) ⊙ mean(h_t)
+   
+3.2 软提示构建：
+   - 图结构提示：prompt_graph = [ĥ_g; position_embedding]
+   - 文本语义提示：prompt_text = h_t
+   - 联合软提示：prompt_joint = [prompt_graph; prompt_text]
+
+3.3 LLM生成：
+   - 输入序列：[BOS; prompt_joint; tokenized_question; SEP]
+   - 生成过程：P(Y|S*, x_q) = ∏_{i=1}^r P(y_i|y_{<i}, prompt_joint)
+   - 输出解码：answer = decode(generated_tokens)
+
+阶段4: 对比学习与优化 (Contrastive Learning and Optimization)
+----------------------------------------------------------
+4.1 正负样本构建：
+   - 正样本：(question, correct_path, correct_answer)
+   - 负样本：(question, incorrect_path, incorrect_answer)
+   - 难负样本：高相似度但错误的推理路径
+
+4.2 多任务损失函数：
+   - 图重构损失：L_graph = ||h_g - reconstruct(h_g)||^2
+   - 文本生成损失：L_text = -log P(y_true|input)
+   - 对比学习损失：L_contrastive = contrastive_loss(h_positive, h_negative)
+   - 总损失：L_total = λ_1*L_graph + λ_2*L_text + λ_3*L_contrastive
+
+4.3 性能评估：
+   - 答案准确率：Accuracy@1, Accuracy@3, Accuracy@5
+   - 推理质量：Path_Quality_Score
+   - 多选一致性：Multi_Choice_Consistency
+
+技术贡献：
+1. 提出渐进式注意力剪枝机制，解决图规模爆炸问题
+2. 设计多模态图表示融合架构，结合结构和语义信息
+3. 创新性地引入结构化多选提示，增强LLM推理能力
+4. 实现自适应图-文本对齐，提高跨模态表示质量
+
+实验验证：
+- 数据集：MetaQA, WebQSP, ComplexWebQuestions
+- 基线方法：GraftNet, PullNet, NSM, UniKGQA
+- 评估指标：Hit@1, Hit@3, Hit@10, F1-score
+- 消融研究：各组件贡献度分析
