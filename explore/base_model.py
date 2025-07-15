@@ -62,7 +62,7 @@ class BaseModel(object):
             subs, rels, objs = self.loader.get_batch(batch_idx) #subs, rels, objs
 
             self.model.zero_grad()
-            n_nodes, n_edges, scores = self.model(subs, rels)
+            n_nodes, n_edges, scores, h_g, h_t, multi_choice_prompt = self.model(subs, rels)
 
             num_nodes += n_nodes / n_batch
             num_edges += n_edges / n_batch
@@ -109,7 +109,8 @@ class BaseModel(object):
             end = min(n_data, (i+1)*batch_size)
             batch_idx = np.arange(start, end)
             subs, rels, objs = self.loader.get_batch(batch_idx, data='valid')
-            scores = self.model(subs, rels, mode='valid').data.cpu().numpy()
+            scores, _, _, _ = self.model(subs, rels, mode='valid')
+            scores = scores.data.cpu().numpy()
             
             filters = 0
 
@@ -128,7 +129,8 @@ class BaseModel(object):
             end = min(n_data, (i+1)*batch_size)
             batch_idx = np.arange(start, end)
             subs, rels, objs = self.loader.get_batch(batch_idx, data='test')
-            scores = self.model(subs, rels, mode='test').data.cpu().numpy()
+            scores, _, _, _ = self.model(subs, rels, mode='test')
+            scores = scores.data.cpu().numpy()
              
             filters = 0
             # ranks = cal_ranks(scores, objs, filters)
