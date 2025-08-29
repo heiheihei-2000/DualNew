@@ -255,33 +255,34 @@ class Explore(torch.nn.Module):
         
         # 生成子图结果用于返回（不再生成多选提示）
         processed_subgraph = ""
-        if mode == 'llm_train' or mode == 'llm_inference':  # 在LLM训练或推理模式下生成子图信息
-            # 需要收集GNN过程中的all_nodes和all_edges来生成子图
-            # 为了获取这些信息，我们需要在前向传播过程中保存它们
-            all_nodes = []
-            all_edges = []
-            
-            # 重新构建nodes用于获取子图信息
-            nodes_for_subgraph = np.concatenate([
-                np.repeat(np.arange(len(subs)), [len(sublist) for sublist in subs]),
-                np.concatenate(subs)
-            ]).reshape(2, -1)
-            nodes_for_subgraph = np.array(nodes_for_subgraph, dtype=np.int64)
-            nodes_for_subgraph = torch.LongTensor(nodes_for_subgraph).T
-            
-            # 通过loader获取邻居信息来构建子图
-            for layer_idx in range(self.n_layer):
-                nodes_np = nodes_for_subgraph.cpu().numpy() if torch.is_tensor(nodes_for_subgraph) else nodes_for_subgraph
-                nodes_data, edges_data, _ = self.loader.get_neighbors(nodes_np, qids, device=self.device)
-                all_nodes.append(nodes_data)
-                all_edges.append(edges_data)
-                nodes_for_subgraph = nodes_data
-            
-            # 生成CSV格式的子图描述
-            processed_subgraph = self.process_all_nodes_edges_to_csv(all_nodes, all_edges)
+        # 已禁用：为 LLM 构建 CSV 子图描述的重复邻居提取，避免重复重计算
+        # if mode == 'llm_train' or mode == 'llm_inference':  # 在LLM训练或推理模式下生成子图信息
+        #     # 需要收集GNN过程中的all_nodes和all_edges来生成子图
+        #     # 为了获取这些信息，我们需要在前向传播过程中保存它们
+        #     all_nodes = []
+        #     all_edges = []
+        #     
+        #     # 重新构建nodes用于获取子图信息
+        #     nodes_for_subgraph = np.concatenate([
+        #         np.repeat(np.arange(len(subs)), [len(sublist) for sublist in subs]),
+        #         np.concatenate(subs)
+        #     ]).reshape(2, -1)
+        #     nodes_for_subgraph = np.array(nodes_for_subgraph, dtype=np.int64)
+        #     nodes_for_subgraph = torch.LongTensor(nodes_for_subgraph).T
+        #     
+        #     # 通过loader获取邻居信息来构建子图
+        #     for layer_idx in range(self.n_layer):
+        #         nodes_np = nodes_for_subgraph.cpu().numpy() if torch.is_tensor(nodes_for_subgraph) else nodes_for_subgraph
+        #         nodes_data, edges_data, _ = self.loader.get_neighbors(nodes_np, qids, device=self.device)
+        #         all_nodes.append(nodes_data)
+        #         all_edges.append(edges_data)
+        #         nodes_for_subgraph = nodes_data
+        #     
+        #     # 生成CSV格式的子图描述
+        #     processed_subgraph = self.process_all_nodes_edges_to_csv(all_nodes, all_edges)
         
 
-        return   h_g_pooled, processed_subgraph
+        return   h_g_pooled, processed_subgraph ,scores_all
 
 
 
@@ -471,9 +472,9 @@ class Explore(torch.nn.Module):
         if mode == 'train':
             qs = qids
         elif mode == 'test':
-            qs = self.loader.n_train+qids+self.loader.n_test
+            qs = qids-self.loader.n_train_qs-self.loader.n_valid_qs
         elif mode =='valid':
-            qs = qids+self.loader.n_train
+            qs = qids-self.loader.n_train_qs
 
         # 写入文件并收集到result_content
         # 写入问题索引作为行开头
@@ -924,22 +925,21 @@ class Explore(torch.nn.Module):
 
     def process_all_nodes_edges_to_csv(self, all_nodes, all_edges):
         """
-        将visual_path收集的all_nodes和all_edges处理为CSV格式
-        仿照textualize_subgraph的处理方式
+        将visual_path收集的all_nodes和all_edges处理为自然语言描述
         
         Args:
             all_nodes: 各层的节点信息列表
             all_edges: 各层的边信息列表
         
         Returns:
-            desc: CSV格式的子图描述
+            desc: 自然语言格式的子图描述
         """
         # 收集所有层的唯一节点和边
         unique_nodes = set()
-        edge_data = []
+        edge_triples = []
         
-        # 遍历所有层的edges
-        for layer_edges in all_edges:
+        # 遍历所有层的edges，收集三元组
+        for layer_idx, layer_edges in enumerate(all_edges):
             for edge in layer_edges:
                 batch_idx, head_id, rel_id, tail_id = edge[0], edge[1], edge[2], edge[3]
                 
@@ -951,37 +951,60 @@ class Explore(torch.nn.Module):
                 head_name = self.loader.id2entity.get(int(head_id), f"entity_{int(head_id)}")
                 tail_name = self.loader.id2entity.get(int(tail_id), f"entity_{int(tail_id)}")
                 
-                unique_nodes.add((int(head_id), head_name))
-                unique_nodes.add((int(tail_id), tail_name))
+                unique_nodes.add(head_name)
+                unique_nodes.add(tail_name)
                 
                 # 处理反向关系
                 if rel_id >= self.n_rel:
                     rel_name = self.loader.id2relation.get(int(rel_id) - self.n_rel, f"relation_{int(rel_id) - self.n_rel}")
-                    # 反向关系：交换head和tail
-                    edge_data.append((tail_name, rel_name, head_name))
+                    # 反向关系：构建自然语言描述
+                    triple = (tail_name, rel_name, head_name)
                 else:
                     rel_name = self.loader.id2relation.get(int(rel_id), f"relation_{int(rel_id)}")
-                    edge_data.append((head_name, rel_name, tail_name))
+                    triple = (head_name, rel_name, tail_name)
+                
+                edge_triples.append(triple)
         
-        # 生成节点CSV
-        node_csv_lines = ["node_name"]
-        for node_id, node_name in sorted(unique_nodes, key=lambda x: x[1]):
-            node_csv_lines.append(node_name)
-        nodes_csv = "\n".join(node_csv_lines)
+        # 去重并排序
+        unique_triples = sorted(set(edge_triples))
+        unique_nodes = sorted(unique_nodes)
         
-        # 生成边CSV
-        edge_csv_lines = ["src,edge_attr,dst"]
-        for src, rel, dst in sorted(set(edge_data)):  # 去重
-            # 转义CSV中的逗号和引号
-            src_escaped = f'"{src}"' if ',' in src else src
-            rel_escaped = f'"{rel}"' if ',' in rel else rel
-            dst_escaped = f'"{dst}"' if ',' in dst else dst
-            edge_csv_lines.append(f"{src_escaped},{rel_escaped},{dst_escaped}")
-        edges_csv = "\n".join(edge_csv_lines)
+        # 生成自然语言描述
+        nl_descriptions = []
         
-        # 按照desc格式组合：nodes + edges
-        desc = f"{nodes_csv}\n\n{edges_csv}"
-
+        # 1. 描述涉及的实体
+        if unique_nodes:
+            nl_descriptions.append(f"The knowledge graph contains {len(unique_nodes)} entities: {', '.join(unique_nodes[:10])}" + 
+                                  (f" and {len(unique_nodes)-10} more" if len(unique_nodes) > 10 else ""))
+        
+        # 2. 描述关系和连接
+        nl_descriptions.append(f"\nThere are {len(unique_triples)} relationships in the graph:")
+        
+        # 3. 将三元组转换为自然语言句子
+        for i, (subj, rel, obj) in enumerate(unique_triples[:20]):  # 限制最多显示20个关系
+            # 根据关系类型生成更自然的语言
+            if "is" in rel.lower() or "was" in rel.lower():
+                sentence = f"- {subj} {rel} {obj}"
+            elif "of" in rel.lower() or "in" in rel.lower() or "at" in rel.lower():
+                sentence = f"- {subj} has {rel}: {obj}"
+            elif rel.endswith("ed") or rel.endswith("ing"):
+                sentence = f"- {subj} {rel} {obj}"
+            else:
+                # 默认格式
+                sentence = f"- {subj} has relation '{rel}' with {obj}"
+            
+            nl_descriptions.append(sentence)
+        
+        if len(unique_triples) > 20:
+            nl_descriptions.append(f"... and {len(unique_triples)-20} more relationships")
+        
+        # 4. 添加图结构总结
+        nl_descriptions.append(f"\nGraph summary: This subgraph explores {len(all_edges)} layers of connections, "
+                             f"starting from the query entities and expanding through relevant relationships.")
+        
+        # 组合所有描述
+        desc = "\n".join(nl_descriptions)
+        
         return desc
 
     def softmax(self, x):
