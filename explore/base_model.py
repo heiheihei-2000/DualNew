@@ -62,10 +62,10 @@ class BaseModel(object):
             subs, rels, objs = self.loader.get_batch(batch_idx)  # subs, rels, objs
 
             self.model.zero_grad()
-            n_nodes, n_edges, scores, h_g_pooled, result_content, processed_subgraph = self.model(subs, rels)
+            n_nodes, n_edges, scores = self.model(subs, rels)
 
-            num_nodes += n_nodes / n_batch
-            num_edges += n_edges / n_batch
+            num_nodes = num_nodes + n_nodes / n_batch
+            num_edges = num_edges + n_edges / n_batch
 
             pos_scores = scores[[torch.arange(len(scores)).cuda(), torch.LongTensor(objs).cuda()]]
             max_n = torch.max(scores, 1, keepdim=True)[0]

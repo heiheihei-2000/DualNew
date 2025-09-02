@@ -55,7 +55,7 @@ def parse_args_graph_llm():
     parser.add_argument('--act', type=str, default='relu',
                        choices=['relu', 'tanh', 'idd'],
                        help='Activation function')
-    parser.add_argument('--K', type=int, default=150,
+    parser.add_argument('--K', type=int, default=200,
                        help='Number of neighbors to sample')
     parser.add_argument('--sample', type=int, default=1,
                        help='Whether to use sampling')
@@ -63,13 +63,13 @@ def parse_args_graph_llm():
     # LLM parameters
     parser.add_argument('--max_txt_len', type=int, default=256,
                        help='Maximum text sequence length')
-    parser.add_argument('--max_new_tokens', type=int, default=128,
+    parser.add_argument('--max_new_tokens', type=int, default=256,
                        help='Maximum new tokens to generate')
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=2,
                        help='Training batch size')
-    parser.add_argument('--eval_batch_size', type=int, default=1,
+    parser.add_argument('--eval_batch_size', type=int, default=20,
                        help='Evaluation batch size')
     parser.add_argument('--num_epochs', type=int, default=10,
                        help='Number of training epochs')
@@ -99,6 +99,8 @@ def parse_args_graph_llm():
                        help='Use 8-bit quantization for LLM to reduce memory usage')
     parser.add_argument('--disable_tqdm', action='store_true',
                        help='Disable tqdm progress bars to avoid buffering issues')
+    parser.add_argument('--load', action='store_true',
+                       help='Load pretrained weights from checkpoint to continue training')
     
     return parser.parse_args()
 
@@ -505,125 +507,14 @@ def evaluate_model_batch(model, loader, args, data='test', eval_batch_size=None)
                     continue
                 seen.add(rel_qid)
                 record = {'id': rel_qid, 'answer': pred_text.replace('\n', ' '), 'question': qtext.replace('\n', ' ')}
+                print(record)
                 wf.write(json.dumps(record, ensure_ascii=False) + '\n')
         print(f"Wrote predictions to {ans_out_path} (deduped by relative qid)")
 
     return metrics
 
 
-# def evaluate_model_batch(model, loader, args, data='test', eval_batch_size=None):
-#     """评估模型（使用check.py的评估逻辑）"""
-#     import os
-#     import sys
-#
-#     model.eval()
-#     batch_size = eval_batch_size if eval_batch_size is not None else args.n_tbatch
-#
-#     # 确定数据集大小
-#     if data == 'valid':
-#         n_data = loader.n_valid
-#     else:  # test
-#         n_data = loader.n_test
-#
-#     n_batch = n_data // batch_size + (n_data % batch_size > 0)
-#
-#     output_path = f'{args.output_dir}/predictions_{args.dataset}_{data}.jsonl'
-#     os.makedirs(args.output_dir, exist_ok=True)
-#
-#     all_preds = []
-#     all_labels = []
-#     all_questions = []
-#
-#     with torch.no_grad():
-#         # 使用条件tqdm
-#         iterator = range(n_batch)
-#         if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
-#             iterator = tqdm(iterator, desc=f"Evaluating {data}")
-#
-#         for i in iterator:
-#             start = i * batch_size
-#             end = min(n_data, (i + 1) * batch_size)
-#             batch_idx = np.arange(start, end)
-#
-#             # 使用get_batch获取数据
-#             subs, qids, objs = loader.get_batch(batch_idx, data=data)
-#
-#             # 转换为GraphLLM期望的格式
-#             questions = []
-#             labels = []
-#             for j, q_id in enumerate(qids):
-#                 question_text = loader.id2question.get(q_id, f"question_{q_id}")
-#                 questions.append(question_text)
-#
-#                 # 处理答案 - train_data中每个样本已经是单个答案
-#                 answer_entity = objs[j]
-#                 if isinstance(answer_entity, (np.ndarray, np.generic)) or torch.is_tensor(answer_entity):
-#                     answer_entity = answer_entity.item()
-#                     # objs[j]应该是单个答案实体ID（因为train_data在read_web_qa中已经拆分）
-#                 answer_text = loader.id2entity.get(answer_entity, f"entity_{answer_entity}")
-#                 labels.append(answer_text)
-#
-#             batch = {
-#                 'subs': subs.tolist() if isinstance(subs, np.ndarray) else subs,
-#                 'qids': qids.tolist() if isinstance(qids, np.ndarray) else qids,
-#                 'question': questions,
-#                 'label': labels
-#             }
-#
-#             # 获取模型预测
-#             output = model.inference(batch)
-#             preds = output['pred'] if isinstance(output['pred'], list) else [output['pred']]
-#             questions_output = output['question'] if isinstance(output['question'], list) else [output['question']]
-#
-#             all_preds.extend(preds)
-#             all_labels.extend(labels)
-#             all_questions.extend(questions_output)
-#
-#             # 定期清理内存和输出进度
-#             if (i + 1) % 10 == 0:
-#                 torch.cuda.empty_cache()
-#                 print(f"Processed {len(all_preds)}/{n_data} samples...", flush=True)
-#                 sys.stdout.flush()
-#
-#     # 保存预测结果到llama目录（check.py需要的格式）
-#     dataset_name = args.dataset.replace('/', '-') if '/' in args.dataset else args.dataset
-#     check_output_path = f'{dataset_name}-ans.jsonl'
-#
-#     print(f"\nSaving predictions for check.py to {check_output_path}...")
-#     with open(check_output_path, 'w') as f:
-#         for i, pred in enumerate(all_preds):
-#             data = {
-#                 'id': i,
-#                 'answer': pred.replace('\n', ' '),
-#                 'question': all_questions[i].replace('\n', ' ') if i < len(all_questions) else ''
-#             }
-#             f.write(json.dumps(data) + '\n')
-#     print(f"Saved {len(all_preds)} predictions successfully!")
-#
-#     # 使用check.py的评估逻辑
-#     print(f"\nCalculating Hit rate using check.py for {args.dataset}...")
-#
-#
-#
-#     try:
-#
-#
-#         # 直接调用check函数
-#         check(dataset=args.dataset)
-#
-#         # 从check的输出文件读取hit@1
-#         check_result_file = f'check-{dataset_name}-ans.jsonl'
-#         hit_rate = 0
-#         if os.path.exists(check_result_file):
-#             with open(check_result_file, 'r') as f:
-#                 lines = f.readlines()
-#                 if lines:
-#                     last_line = json.loads(lines[-1])
-#                     hit_rate = last_line.get('HIT@1', 0) * 100
-#     finally:
-#          print("")
-#
-#     return hit_rate
+
 
 
 def main(args):
@@ -637,13 +528,13 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    # 初始化wandb
-    if args.use_wandb:
-        wandb.init(
-            project=args.project,
-            name=f"{args.dataset}_GraphLLM_seed{args.seed}",
-            config=vars(args)
-        )
+    # # 初始化wandb
+    # if args.use_wandb:
+    #     wandb.init(
+    #         project=args.project,
+    #         name=f"{args.dataset}_GraphLLM_seed{args.seed}",
+    #         config=vars(args)
+    #     )
     
     print("Arguments:", flush=True)
     for key, value in vars(args).items():
@@ -713,7 +604,7 @@ def main(args):
         opts.dropout = 0.1
         opts.act = 'idd'
         opts.n_batch = args.batch_size # Start with batch size 1 to debug
-        opts.n_tbatch = 1
+        opts.n_tbatch = 20
         opts.K = 200
         loaders = [KGDataLoader(args.dataset)]
     elif dataset == 'CWQ':
@@ -760,6 +651,8 @@ def main(args):
     print(f"Train samples: {n_train}")
     print(f"Valid samples: {n_valid}")
     print(f"Test samples: {n_test}")
+    print(f"\nGradient Accumulation Steps: {args.grad_steps}")
+    print(f"Effective batch size: {args.batch_size * args.grad_steps}")
     
     # 构建模型
     print("Building GraphLLM model...")
@@ -791,6 +684,10 @@ def main(args):
     trainable_params, all_params = model.print_trainable_params()
     print(f"Trainable params: {trainable_params} || All params: {all_params} || "
           f"Trainable%: {100 * trainable_params / all_params:.2f}%")
+    print(f"\nTraining configuration:")
+    print(f"  Micro batch size: {batch_size}")
+    print(f"  Gradient accumulation steps: {args.grad_steps}")
+    print(f"  Effective batch size: {batch_size * args.grad_steps}")
     
     # 设置优化器（与train.py保持一致）
     params = [p for p in model.parameters() if p.requires_grad]
@@ -799,6 +696,41 @@ def main(args):
     # 设置学习率调度器（与train.py相同）
 
     scheduler = ExponentialLR(optimizer, opts.decay_rate)
+    
+    # 如果需要加载预训练权重
+    start_epoch = 0
+    if args.load:
+        checkpoint_path = os.path.join('checkpoints/graph_llm', f'best_model_{args.dataset}.pth')
+        if os.path.exists(checkpoint_path):
+            print(f"\nLoading pretrained weights from {checkpoint_path}...")
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{args.gpu}', weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{args.gpu}')
+            
+            # 加载模型状态
+            model_state = checkpoint.get('model_state_dict', checkpoint)
+            missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+            
+            if missing_keys:
+                print(f"Missing keys when loading model: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys when loading model: {unexpected_keys}")
+            
+            # 加载优化器状态（如果存在）
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Loaded optimizer state")
+            
+            # 获取开始的epoch（如果存在）
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"Resuming from epoch {start_epoch}")
+            
+            print(f"Successfully loaded pretrained weights from {checkpoint_path}")
+        else:
+            print(f"Warning: Checkpoint file not found at {checkpoint_path}")
+            print("Starting training from scratch...")
     
     # 如果只是评估模式，跳过训练
     if args.eval_only:
@@ -814,8 +746,13 @@ def main(args):
         gc.collect()
         
         # 加载模型
-        model = load_best_model(model, args)
-        
+        # model = load_best_model(model, args)
+
+
+
+
+
+
         # 最终评估（使用与train.py相同的评估方式）
         print("Running evaluation on test set...", flush=True)
         sys.stdout.flush()
@@ -847,7 +784,7 @@ def main(args):
     best_hit_rate = 0.0
     best_epoch = 0
     
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         # 打乱训练数据（与base_model.py的train_batch相同）
         loader.shuffle_train()
         
@@ -867,6 +804,11 @@ def main(args):
         iterator = range(n_batch)
         if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
             iterator = tqdm(iterator, desc="Training")
+        
+        # Gradient accumulation settings
+        accumulation_steps = args.grad_steps
+        optimizer.zero_grad()
+        accumulated_loss = 0.0
         
         for i in iterator:
             start = i * batch_size
@@ -896,15 +838,27 @@ def main(args):
                 'label': labels
             }
             
-            optimizer.zero_grad()
+            # Forward pass and scale loss by accumulation steps
             loss = model(batch)
+            loss = loss / accumulation_steps
             loss.backward()
             
-            # 梯度裁剪
-            clip_grad_norm_(params, max_norm=1.0)
-            optimizer.step()
+            accumulated_loss += loss.item()
             
-            epoch_loss += loss.item()
+            # Perform optimizer step every accumulation_steps iterations
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == n_batch:
+                # 梯度裁剪
+                clip_grad_norm_(params, max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                # Add accumulated loss to epoch loss (multiply back by accumulation_steps)
+                epoch_loss += accumulated_loss * accumulation_steps
+                accumulated_loss = 0.0
+            
+            # Update progress bar with current accumulated loss
+            if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
+                iterator.set_postfix({'loss': accumulated_loss * accumulation_steps})
             
             # 定期清理内存
             if (i + 1) % 10 == 0:
@@ -918,16 +872,15 @@ def main(args):
         
         # 验证阶段 - 计算Hit率
         print(f"Evaluating Hit Rate on validation set...")
-        val_hit_rate = evaluate_model_batch(model, loader, args, data='valid', eval_batch_size=eval_batch_size)
+        val_hit_rate = evaluate_model_batch(model, loader, args, data='test', eval_batch_size=eval_batch_size)
         print(f"Epoch {epoch+1}/{args.num_epochs} - Val Hit Rate: {val_hit_rate:.4f}%")
-        
-        # 记录日志
-        if args.use_wandb:
-            wandb.log({
-                'Epoch': epoch + 1,
-                'Train Loss': avg_train_loss,
-                'Val Hit Rate': val_hit_rate
-            })
+        # # 记录日志
+        # if args.use_wandb:
+        #     wandb.log({
+        #         'Epoch': epoch + 1,
+        #         'Train Loss': avg_train_loss,
+        #         'Val Hit Rate': val_hit_rate
+        #     })
         
         # 保存最佳模型（基于Hit率）
         if val_hit_rate > best_hit_rate:
@@ -952,9 +905,9 @@ def main(args):
     # 训练完成，清理资源
     print(f"Training completed! Best Val Hit Rate: {best_hit_rate:.4f}% at epoch {best_epoch+1}")
     
-    if args.use_wandb:
-        wandb.log({'Best Val Hit Rate': best_hit_rate})
-        wandb.finish()
+    # if args.use_wandb:
+    #     wandb.log({'Best Val Hit Rate': best_hit_rate})
+    #     wandb.finish()
     
     # 清理内存
     torch.cuda.empty_cache()

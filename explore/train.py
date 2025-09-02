@@ -145,7 +145,7 @@ if __name__ == '__main__':
     if args.load:
         checkpoint = 'webqsp_best_saved_model.pt'
         model.load_model(checkpoint)
-        model.get_path(mode='valid',dataset='webqsp')
+        model.get_path(mode='test',dataset='webqsp')
         with open(opts.perf_file, 'a+') as f:
             f.write('[load-WebCWQ]' + checkpoint + '\n')
 
