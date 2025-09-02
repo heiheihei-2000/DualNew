@@ -6,7 +6,7 @@ import numpy as np
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, use_lama_rel, K, sample_flag, act=lambda x: x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, use_lama_rel, K, sample_flag, act=lambda x: x, use_adaptive_k: bool = False, use_relation_gating: bool = False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
@@ -16,6 +16,9 @@ class GNNLayer(torch.nn.Module):
         self.use_lama_rel = use_lama_rel
         self.K = K
         self.sample_flag = sample_flag
+        # 可选开关（默认关闭以保持速度）
+        self.use_adaptive_k = use_adaptive_k
+        self.use_relation_gating = use_relation_gating
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim)
         self.Wr_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -24,6 +27,14 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha = nn.Linear(attn_dim, 1)
 
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
+        
+        # 关系感知门控（可选）
+        if self.use_relation_gating:
+            self.relation_gates = nn.Parameter(torch.randn(n_rel * 2 + 1, in_dim))
+            self.relation_importance = nn.Linear(in_dim * 2, 1)
+        else:
+            self.relation_gates = None
+            self.relation_importance = None
 
     def forward(self, q_sub, q_rel, q_emb, rela_embed, hidden, edges, nodes, old_nodes_new_idx):
         # edges:  [batch_idx, head, rela, tail, old_idx, new_idx] # q_rel 代表问题的id
@@ -51,45 +62,81 @@ class GNNLayer(torch.nn.Module):
         sample_flag = self.sample_flag
         # ========= alpha + [0:2]=============
         if sample_flag == 1:
-            max_ent_per_ent = self.K
-            _, ind1 = torch.unique(edges[:, 0:2], dim=0, sorted=True, return_inverse=True)
-            _, ind2 = torch.sort(ind1)
-            edges = edges[ind2]  # sort edges
-            alpha = alpha[ind2]
-            _, counts = torch.unique(edges[:, 0:2], dim=0, return_counts=True)
-            # print(id_layer, counts)
-            # breakpoint()
-            idd_idx = edges[:, 2] == (self.n_rel * 2)
-            idd_edges = edges[idd_idx]
+            if self.use_adaptive_k:
+                # 慢：自适应K（逐源循环）
+                _, ind1 = torch.unique(edges[:, 0:2], dim=0, sorted=True, return_inverse=True)
+                _, ind2 = torch.sort(ind1)
+                edges = edges[ind2]  # sort edges
+                alpha = alpha[ind2]
+                _, counts = torch.unique(edges[:, 0:2], dim=0, return_counts=True)
 
-            probs = alpha.squeeze()
-            # print(probs.shape, counts.shape)
-            topk_value, topk_index = variadic_topk(probs, counts, k=max_ent_per_ent)
-            cnt_sum = torch.cumsum(counts, dim=0)
-            cnt_sum[1:] = cnt_sum[:-1] + 0
-            cnt_sum[0] = 0
-            # print(topk_index.shape, cnt_sum.shape)
-            topk_index = topk_index + cnt_sum.unsqueeze(1)
+                idd_idx = edges[:, 2] == (self.n_rel * 2)
+                idd_edges = edges[idd_idx]
 
-            mask = topk_index.view(-1, 1).squeeze()
-            mask = torch.unique(mask)
-            # print('original: ', l1)
-            # print('mask:', len(mask))
+                probs = alpha.squeeze()
 
-            edges = edges[mask]
-            edges = torch.cat((edges, idd_edges), 0)
-            edges = torch.unique(edges[:, :], dim=0)
+                mask_indices = []
+                start_idx = 0
+                for count in counts:
+                    end_idx = start_idx + count
+                    node_probs = probs[start_idx:end_idx]
+                    if count > 1:
+                        node_probs_norm = torch.softmax(node_probs, dim=0)
+                        entropy = -(node_probs_norm * torch.log(node_probs_norm + 1e-10)).sum()
+                        entropy_factor = 0.5 + torch.sigmoid(entropy).item()
+                        adaptive_k = min(int(self.K * entropy_factor), count.item())
+                    else:
+                        adaptive_k = 1
+                    if adaptive_k > 0:
+                        _, topk_idx = torch.topk(node_probs, min(adaptive_k, count.item()))
+                        mask_indices.extend((start_idx + topk_idx).tolist())
+                    start_idx = end_idx
 
-            nodes, tail_index = torch.unique(edges[:, [0, 3]], dim=0, sorted=True, return_inverse=True)
-            edges = torch.cat([edges[:, 0:5], tail_index.unsqueeze(1)], 1)
+                mask = torch.tensor(mask_indices, dtype=torch.long, device=edges.device)
+                edges = edges[mask]
+                edges = torch.cat((edges, idd_edges), 0)
+                edges = torch.unique(edges[:, :], dim=0)
 
-            head_index = edges[:, 4]
-            idd_mask = edges[:, 2] == (self.n_rel * 2)
-            _, old_idx = head_index[idd_mask].sort()
-            old_nodes_new_idx = tail_index[idd_mask][old_idx]
+                nodes, tail_index = torch.unique(edges[:, [0, 3]], dim=0, sorted=True, return_inverse=True)
+                edges = torch.cat([edges[:, 0:5], tail_index.unsqueeze(1)], 1)
 
-        else:
-            pass
+                head_index = edges[:, 4]
+                idd_mask = edges[:, 2] == (self.n_rel * 2)
+                _, old_idx = head_index[idd_mask].sort()
+                old_nodes_new_idx = tail_index[idd_mask][old_idx]
+            else:
+                # 快：原始 variadic_topk
+                max_ent_per_ent = self.K
+                _, ind1 = torch.unique(edges[:, 0:2], dim=0, sorted=True, return_inverse=True)
+                _, ind2 = torch.sort(ind1)
+                edges = edges[ind2]  # sort edges
+                alpha = alpha[ind2]
+                _, counts = torch.unique(edges[:, 0:2], dim=0, return_counts=True)
+                idd_idx = edges[:, 2] == (self.n_rel * 2)
+                idd_edges = edges[idd_idx]
+
+                probs = alpha.squeeze()
+                topk_value, topk_index = variadic_topk(probs, counts, k=max_ent_per_ent)
+
+                cnt_sum = torch.cumsum(counts, dim=0)
+                cnt_sum[1:] = cnt_sum[:-1] + 0
+                cnt_sum[0] = 0
+                topk_index = topk_index + cnt_sum.unsqueeze(1)
+
+                mask = topk_index.view(-1, 1).squeeze()
+                mask = torch.unique(mask)
+
+                edges = edges[mask]
+                edges = torch.cat((edges, idd_edges), 0)
+                edges = torch.unique(edges[:, :], dim=0)
+
+                nodes, tail_index = torch.unique(edges[:, [0, 3]], dim=0, sorted=True, return_inverse=True)
+                edges = torch.cat([edges[:, 0:5], tail_index.unsqueeze(1)], 1)
+
+                head_index = edges[:, 4]
+                idd_mask = edges[:, 2] == (self.n_rel * 2)
+                _, old_idx = head_index[idd_mask].sort()
+                old_nodes_new_idx = tail_index[idd_mask][old_idx]
 
         sub = edges[:, 4]
         rel = edges[:, 2]
@@ -104,10 +151,19 @@ class GNNLayer(torch.nn.Module):
         r_idx = edges[:, 0]
         h_qr = q_emb[edges[:, 0], :]
 
-        message = hs * hr
-        alpha = torch.sigmoid(self.w_alpha(
-            nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wq_attn(h_qr) + self.Wqr_attn(hr * h_qr))))
-        message = alpha * message
+        # 消息传递（可选关系门控）
+        if self.use_relation_gating and (self.relation_gates is not None):
+            gate = torch.sigmoid(self.relation_gates[rel])  # [n_edges, hidden_dim]
+            importance = torch.sigmoid(self.relation_importance(torch.cat([hr, h_qr], dim=-1)))  # [n_edges, 1]
+            message = hs * gate * hr * importance
+            alpha = torch.sigmoid(self.w_alpha(
+                nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wq_attn(h_qr) + self.Wqr_attn(hr * h_qr))))
+            message = alpha * message
+        else:
+            message = hs * hr
+            alpha = torch.sigmoid(self.w_alpha(
+                nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wq_attn(h_qr) + self.Wqr_attn(hr * h_qr))))
+            message = alpha * message
 
         message_agg = scatter(message, index=obj, dim=0, dim_size=nodes.size(0), reduce='sum')
 
@@ -145,15 +201,27 @@ class Explore(torch.nn.Module):
         ).to(self.device)  # Move to the correct device
         self.use_lama_rel = 1
         if self.use_lama_rel == 1:
-            self.rela_embed = self.load_rel_emb().detach()
+            self.rela_embed = self.load_rel_emb().detach().to(self.device)
         else:
             self.rela_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
 
         self.gnn_layers = []
         for i in range(3):
+            use_adaptive_k_first = (getattr(params, 'use_adaptive_k', True) and i == 0)
             self.gnn_layers.append(
-                GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.use_lama_rel, self.K,
-                         self.sample_flag, act=act))
+                GNNLayer(
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    self.attn_dim,
+                    self.n_rel,
+                    self.use_lama_rel,
+                    self.K,
+                    self.sample_flag,
+                    act=act,
+                    use_adaptive_k=use_adaptive_k_first,
+                    use_relation_gating=getattr(params, 'use_relation_gating', False),
+                )
+            )
         # self.gnn_layers = nn.ModuleList(self.gnn_layers)
         # # Move all GNN layers to the correct device
         # for layer in self.gnn_layers:
@@ -169,6 +237,10 @@ class Explore(torch.nn.Module):
             nn.ReLU(),
             nn.Linear(2 * self.hidden_dim, 1)
         ).to(self.device)
+        # 轻量路径感知评分：对最后一层关系向量按注意力聚合，作为加分项
+        self.path_proj = nn.Linear(self.hidden_dim, 1).to(self.device)
+        self.path_coef = 0.2  # 加权系数，可在需要时调节
+        
         self.Wr = nn.Linear(self.hidden_dim, self.hidden_dim, bias=True).to(self.device)  # r^-1 = Wr+b
         self.loop = nn.Parameter(torch.randn(1, self.hidden_dim))
 
@@ -178,16 +250,14 @@ class Explore(torch.nn.Module):
         # q_id = torch.LongTensor(qids)  # .cuda()
         q_sub = subs
 
-        # qids -> device
-        q_id = torch.as_tensor(qids, dtype=torch.long, device=self.device)
-        ques_emb = self.question_emb[q_id]  # 已在同一设备，无需再 to()
-        q_emb = self.dim_reduct(ques_emb)  # 与层在同一 device
-        ques_emb = ques_emb.cpu()
+        # qids -> 与 question_emb 同设备，避免索引设备不一致
+        q_id = torch.as_tensor(qids, dtype=torch.long, device=self.question_emb.device)
+        ques_emb = self.question_emb[q_id]
+        q_emb = self.dim_reduct(ques_emb)
 
         if self.use_lama_rel == 1:
-            self.rela_embed = self.rela_embed.to(self.device)
+            # rela_embed 已在 __init__/change_loader 中放到 device
             rel_emb = self.dim_reduct(self.rela_embed)
-            self.rela_embed = self.rela_embed.cpu()
 
             rel_emb = rel_emb[0:self.n_rel, :]
             rev_rel_emb = self.Wr(rel_emb)
@@ -215,6 +285,12 @@ class Explore(torch.nn.Module):
         num_nodes = np.zeros((self.n_layer, 2))
         num_edges = np.zeros((self.n_layer, 2))
         scores_all = []
+        
+        # 方案5：保存每层的路径信息用于路径感知评分
+        layer_hidden_states = []  # 保存每层的隐藏状态（按各层自身节点顺序）
+        layer_edges = []          # 保存每层的边信息
+        layer_mappings = []       # 保存上一层到当前层的节点映射 old_nodes_new_idx（用于对齐）
+        
         for i in range(self.n_layer):
             # nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), qids, device=self.device)
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(
@@ -228,12 +304,32 @@ class Explore(torch.nn.Module):
             hidden = self.dropout(hidden)
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)
+            
+            # 保存每层的信息
+            layer_hidden_states.append(hidden)
+            layer_edges.append(edges)
+            layer_mappings.append(old_nodes_new_idx)
 
             num_nodes[i, :] += num_node
             num_edges[i, :] += num_edge
 
         h_qs = q_emb[nodes[:, 0], :]
-        scores = self.mlp(torch.cat((hidden, h_qs), dim=1)).squeeze(-1)
+        
+        # 方案5：轻量路径感知评分
+        base_scores = self.mlp(torch.cat((hidden, h_qs), dim=1)).squeeze(-1)
+        # 使用最后一层的边和注意力，按目标节点归一化聚合关系向量作为路径摘要
+        # 注：last_edges 与 last_alpha 在上面的循环末尾可被记录，这里用当前层的 edges/alpha 近似
+        rel_idx_last = edges[:, 2]
+        obj_last = edges[:, 5]
+        rel_vec_last = rel_emb[rel_idx_last, :]
+        alpha_w = alpha.squeeze()
+        sum_per_obj = scatter(alpha_w, index=obj_last, dim=0, dim_size=nodes.size(0), reduce='sum')
+        denom = sum_per_obj[obj_last] + 1e-9
+        alpha_norm = alpha_w / denom
+        path_rel = scatter(alpha_norm.unsqueeze(1) * rel_vec_last, index=obj_last, dim=0, dim_size=nodes.size(0), reduce='sum')
+        path_bias = self.path_proj(path_rel).squeeze(-1)
+        scores = base_scores + self.path_coef * path_bias
+        
         scores_all = torch.zeros((n_qs, self.loader.n_ent)).to(self.device)
         scores_all[[nodes[:, 0], nodes[:, 1]]] = scores
         
@@ -257,7 +353,7 @@ class Explore(torch.nn.Module):
         if mode in ('llm_train', 'llm_inference'):
             return h_g_pooled, processed_subgraph, scores_all
         else:
-            # all_nodes/all_edges/old_nodes_new_idx 在旧评估流程中未使用，这里返回占位 None
+            # 兼容旧评估调用，返回6元组（后3项占位）
             return num_nodes, num_edges, scores_all
 
 
@@ -308,8 +404,8 @@ class Explore(torch.nn.Module):
     def change_loader(self, loader):
 
         self.loader = loader
-        self.question_emb = self.load_qemb().detach()
-        self.rela_embed = self.load_rel_emb().detach()
+        self.question_emb = self.load_qemb().detach().to(self.device)
+        self.rela_embed = self.load_rel_emb().detach().to(self.device)
         self.n_rel = self.loader.n_rel
         print('change loader:', self.loader.task_dir)
 
