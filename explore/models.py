@@ -65,10 +65,6 @@ class GNNLayer(torch.nn.Module):
             probs = alpha.squeeze()
             # print(probs.shape, counts.shape)
             topk_value, topk_index = variadic_topk(probs, counts, k=max_ent_per_ent)
-
-
-
-
             cnt_sum = torch.cumsum(counts, dim=0)
             cnt_sum[1:] = cnt_sum[:-1] + 0
             cnt_sum[0] = 0
@@ -255,34 +251,14 @@ class Explore(torch.nn.Module):
         
         # 生成子图结果用于返回（不再生成多选提示）
         processed_subgraph = ""
-        # 已禁用：为 LLM 构建 CSV 子图描述的重复邻居提取，避免重复重计算
-        # if mode == 'llm_train' or mode == 'llm_inference':  # 在LLM训练或推理模式下生成子图信息
-        #     # 需要收集GNN过程中的all_nodes和all_edges来生成子图
-        #     # 为了获取这些信息，我们需要在前向传播过程中保存它们
-        #     all_nodes = []
-        #     all_edges = []
-        #     
-        #     # 重新构建nodes用于获取子图信息
-        #     nodes_for_subgraph = np.concatenate([
-        #         np.repeat(np.arange(len(subs)), [len(sublist) for sublist in subs]),
-        #         np.concatenate(subs)
-        #     ]).reshape(2, -1)
-        #     nodes_for_subgraph = np.array(nodes_for_subgraph, dtype=np.int64)
-        #     nodes_for_subgraph = torch.LongTensor(nodes_for_subgraph).T
-        #     
-        #     # 通过loader获取邻居信息来构建子图
-        #     for layer_idx in range(self.n_layer):
-        #         nodes_np = nodes_for_subgraph.cpu().numpy() if torch.is_tensor(nodes_for_subgraph) else nodes_for_subgraph
-        #         nodes_data, edges_data, _ = self.loader.get_neighbors(nodes_np, qids, device=self.device)
-        #         all_nodes.append(nodes_data)
-        #         all_edges.append(edges_data)
-        #         nodes_for_subgraph = nodes_data
-        #     
-        #     # 生成CSV格式的子图描述
-        #     processed_subgraph = self.process_all_nodes_edges_to_csv(all_nodes, all_edges)
-        
-
-        return   h_g_pooled, processed_subgraph ,scores_all
+        # 兼容两套调用：
+        # - GraphLLM 使用 llm_train/llm_inference，返回 (h_g_pooled, processed_subgraph, scores_all)
+        # - 旧版 BaseModel/train.py 使用 train/valid/test，返回 (num_nodes, num_edges, scores_all, _, _, _)
+        if mode in ('llm_train', 'llm_inference'):
+            return h_g_pooled, processed_subgraph, scores_all
+        else:
+            # all_nodes/all_edges/old_nodes_new_idx 在旧评估流程中未使用，这里返回占位 None
+            return num_nodes, num_edges, scores_all
 
 
 
