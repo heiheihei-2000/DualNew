@@ -1,7 +1,7 @@
 import contextlib
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast as autocast
+from utils.utils import candidate_path# 期望你项目内已有该函数
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch_scatter import scatter
 from models import Explore
@@ -11,7 +11,10 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
-
+from transformers import BitsAndBytesConfig
+import json
+import numpy as np
+from pathlib import Path
 BOS = '<s>[INST]'
 EOS_USER = '[/INST]'
 EOS = '</s>'
@@ -45,7 +48,7 @@ class GraphLLM(torch.nn.Module):
         print('Loading LLAMA')
         
         # 8bit量化配置
-        from transformers import BitsAndBytesConfig
+
         quant_config = BitsAndBytesConfig(load_in_8bit=True)
         
         llm_kwargs = {
@@ -72,9 +75,10 @@ class GraphLLM(torch.nn.Module):
                 param.requires_grad = False
         else:
             print("Training LLAMA with LORA!")
+            # Prepare model for k-bit training
             model = prepare_model_for_kbit_training(model)
-            lora_r: int = 8
-            lora_alpha: int = 16
+            lora_r: int = 16
+            lora_alpha: int = 32
             lora_dropout: float = 0.05
             lora_target_modules = [
                 "q_proj",
@@ -98,14 +102,6 @@ class GraphLLM(torch.nn.Module):
         graph_device = self.model.device if hasattr(self.model, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.graph_encoder = Explore(args, loader, device=graph_device)
         
-        # 加载预训练的GNN权重
-        if pretrained_gnn_path:
-            self.load_pretrained_gnn(pretrained_gnn_path)
-        
-        # 冻结GNN参数
-        if freeze_gnn:
-            self.freeze_gnn_parameters()
-        
         # h_g投影器：将GNN输出的h_g_pooled投影到LLM维度
         # h_g_pooled: [batch, hidden_dim] -> h_g: [batch, 4096]
         self.h_g_projector = nn.Sequential(
@@ -114,19 +110,61 @@ class GraphLLM(torch.nn.Module):
             nn.Linear(2048, 4096)  # 投影到LLM维度
         ).to(self.model.device)
         
-        # 软提示投影器：将[h_g ; MEAN(h_t)]投影到LLM维度
-        # h_g: [batch, 4096], MEAN(h_t): [batch, 4096] -> soft_prompt: [batch, 4096]
-        self.soft_prompt_projector = nn.Sequential(
-            nn.Linear(4096 * 2, 2048),  # 拼接后的维度
-            nn.ReLU(),
-            nn.Linear(2048, 4096),  # 投影到LLM维度
-        ).to(self.model.device)
+        # # 软提示投影器：将[h_g ; MEAN(h_t)]投影到LLM维度
+        # # h_g: [batch, 4096], MEAN(h_t): [batch, 4096] -> soft_prompt: [batch, 4096]
+        # self.soft_prompt_projector = nn.Sequential(
+        #     nn.Linear(4096 * 2, 2048),  # 拼接后的维度
+        #     nn.ReLU(),
+        #     nn.Linear(2048, 4096),  # 投影到LLM维度
+        # ).to(self.model.device)
+        
+        # 加载预训练的GNN权重
+        if pretrained_gnn_path:
+            self.load_pretrained_gnn(pretrained_gnn_path)
+        
+        # 冻结GNN参数（现在h_g_projector和soft_prompt_projector已经创建）
+        if freeze_gnn:
+            self.freeze_gnn_parameters()
 
         self.word_embedding = self.model.model.get_input_embeddings()
+        
+        # 预加载所有path文件到内存，避免训练时的I/O开销
+        self.preload_all_paths()
 
     @property
     def device(self):
         return list(self.parameters())[0].device
+    
+    def preload_all_paths(self):
+        """预加载所有path文件到内存缓存"""
+        print("Preloading all path files to memory...")
+        if not hasattr(self, "_cand_cache"):
+            self._cand_cache = {}
+        if not hasattr(self, "_prompt_cache"):
+            self._prompt_cache = {}
+        
+        # 根据数据集类型确定要加载的文件
+        path_files = []
+        if 'webqsp' in self.loader.task_dir.lower():
+            path_files = ['webqsp-train-path.txt', 'webqsp-dev-path.txt', 'webqsp-test-path.txt']
+        elif 'cwq' in self.loader.task_dir.lower():
+            path_files = ['CWQ-train-path.txt', 'CWQ-dev-path.txt', 'CWQ-test-path.txt']
+        elif 'metaqa' in self.loader.task_dir.lower():
+            # MetaQA可能有不同的路径文件
+            path_files = ['MetaQA-train-path.txt', 'MetaQA-dev-path.txt', 'MetaQA-test-path.txt']
+        
+        for filepath in path_files:
+            if filepath not in self._cand_cache:
+                try:
+                    print(f"  Loading {filepath}...")
+                    all_candi, all_score, all_p, all_ids = candidate_path(filepath)
+                    self._cand_cache[filepath] = (all_candi, all_score, all_p, all_ids)
+                    print(f"    Loaded {len(all_ids)} questions from {filepath}")
+                except Exception as e:
+                    print(f"    Warning: Failed to load {filepath}: {e}")
+                    self._cand_cache[filepath] = None
+        
+        print("Path files preloading completed!")
 
     def maybe_autocast(self, dtype=torch.bfloat16):
         # if on cpu, don't use autocast
@@ -134,90 +172,143 @@ class GraphLLM(torch.nn.Module):
         enable_autocast = self.device != torch.device("cpu")
 
         if enable_autocast:
-            return torch.cuda.amp.autocast(dtype=dtype)
+            # Use the new torch.amp.autocast API to avoid deprecation warning
+            return torch.amp.autocast(device_type='cuda', dtype=dtype)
         else:
             return contextlib.nullcontext()
 
-    def load_multi_choice_prompt_from_file(self, qid, filepath='webqsp-train-path.txt'):
+
+    def load_multi_choice_prompt_from_file(self, qid, filepath='../explore/webqsp-path.txt'):
         """
-        从文件中读取指定问题ID的多选提示（只读取第一条匹配的记录）
-        
-        Args:
-            qid: 问题ID（相对索引）
-            filepath: 包含多选提示的文件路径
-        
-        Returns:
-            multi_choice_prompt: 该问题的多选提示字符串
+        根据 <dataset>-path.txt 构造多选提示串（参考 hintABCpp 形式）并返回。
+        形式示例：
+          " A. <cand0> (correct probability: <p0>)  {relevant facts: <triples0>}
+            B. <cand1> (correct probability: <p1>)  {relevant facts: <triples1>}
+            C. <cand2> (correct probability: <p2>)  {relevant facts: <triples2>}  Answer: "
+
+        说明：
+        - 优先返回前三个候选（A/B/C）。若不足 3 个则返回现有个数（仅 A，或 A/B）。
+        - 当 qid 不在 path 文件中时，返回 " Answer: "（与参考代码在 else 分支一致，由外层拼接 Question）。
+        - 结果做缓存，避免重复解析文件。
         """
-        # 添加缓存以避免重复读取
-        if not hasattr(self, '_prompt_cache'):
+        # 结果缓存（按 qid + filepath）
+        if not hasattr(self, "_prompt_cache"):
             self._prompt_cache = {}
-        
-        # 检查缓存
-        cache_key = (qid, filepath)
+        cache_key = (int(qid), str(filepath))
         if cache_key in self._prompt_cache:
             return self._prompt_cache[cache_key]
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # 每行格式：qid\t候选答案1|概率1|(路径1);...
-                    parts = line.split('\t')
-                    if len(parts) >= 2:
-                        try:
-                            line_qid = int(parts[0])
-                            if line_qid == qid:
-                                # 找到第一条匹配的记录，缓存并返回
-                                result = '\t'.join(parts[1:])
-                                self._prompt_cache[cache_key] = result
-                                # print(result)
-                                return result
-                        except ValueError:
-                            # 如果无法解析为整数，跳过这行
-                            continue
-        except Exception as e:
-            print(f"Warning: Could not load multi-choice prompt from {filepath}: {e}")
-        
-        # 未找到时也缓存空字符串，避免重复查找
-        self._prompt_cache[cache_key] = ""
-        return ""
-    
-    def encode_graphs(self, subs, qids, question_texts=None):
+
+        # 解析 path 文件缓存（按 filepath）
+        if not hasattr(self, "_cand_cache"):
+            self._cand_cache = {}
+        if filepath not in self._cand_cache:
+            try:
+
+                all_candi, all_score, all_p, all_ids = candidate_path(filepath)
+                self._cand_cache[filepath] = (all_candi, all_score, all_p, all_ids)
+            except Exception as e:
+                print(f"Warning: candidate_path failed for {filepath}: {e}")
+                self._cand_cache[filepath] = None
+
+        data = self._cand_cache.get(filepath)
+        if not data:
+            # 解析失败：返回空的 Answer 提示以保持流程不中断
+            self._prompt_cache[cache_key] = " Answer: "
+            return " Answer: "
+
+        all_candi, all_score, all_p, all_ids = data
+
+        # 将传入的相对 qid 映射到该题在 all_* 列表中的行号
+        qid = int(qid)
+        if qid not in all_ids:
+            # 与参考代码的 else 分支一致：无候选则只给 Answer:
+            self._prompt_cache[cache_key] = " Answer: "
+            return " Answer: "
+
+        i = all_ids[qid]
+
+        # 组装 A/B/C（若不足 3 个则按实际数量返回）
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        n_cand = min(3, len(all_candi[i]))
+        parts = []
+        for k in range(n_cand):
+            cand = str(all_candi[i][k]) if k < len(all_candi[i]) else ""
+            try:
+                prob = all_score[i][k]
+            except Exception:
+                prob = ""
+            try:
+                triples = all_p[i][k]
+            except Exception:
+                triples = ""
+
+            # 与参考格式保持一致：前置空格 + "A. xxx (correct probability: p)  {relevant facts: ...}"
+            # part = f" {letters[k]}. {cand} (correct probability: {prob})  {{relevant facts: {triples}}}"
+            part = f"  {cand} (correct probability: {prob})  {{relevant facts: {triples}}}"
+            parts.append(part)
+
+        # 末尾加上 "  Answer: "
+        result = "  ".join(parts)
+        self._prompt_cache[cache_key] = result
+        # print("result",'---------',result)
+        return result
+
+    def encode_graphs(self, subs, qids, question_texts=None, mode='llm_train'):
         """
-        步骤1: GNN编码图结构 (对应graph_llm.py:108-116)
+        步骤1: GNN编码图结构 - 批量化版本，一次性处理所有问题
         """
-        # 调用现有的GNN模型进行编码
-        results = self.graph_encoder(subs, qids, mode='llm_train', question_texts=question_texts)
-
-        scores_all, h_g_pooled,  processed_subgraph = results
-
-        # 通过h_g投影器将h_g_pooled投影到LLM维度
-        h_g = self.h_g_projector(h_g_pooled)  # [batch_size, hidden_dim] -> [batch_size, 4096]
-
-        return h_g,  processed_subgraph
+        # 直接调用GNN的批量forward
+        results = self.graph_encoder(subs, qids, mode=mode, question_texts=question_texts)
+        
+        if len(results) == 3:
+            h_g_pooled, subgraph, scores = results
+        else:
+            h_g_pooled, subgraph = results
+            scores = None
+        
+        # 投影到LLM维度
+        h_g = self.h_g_projector(h_g_pooled)
+        
+        # 如果需要单独的子图列表，这里拆分
+        subgraph_list = [subgraph] * len(qids) if not isinstance(subgraph, list) else subgraph
+        
+        return h_g, scores, subgraph_list
 
     def generate_text_vector(self, question_text, multi_choice_prompt=None, processed_subgraph=None, max_seq_len=512):
         """
         步骤3: 文本向量生成
         多选提示 + 全局子图A文本化(CSV格式) + 问题 → LLM Token Embedding → h_t
         """
-        # 使用传入的processed_subgraph，如果没有则使用textualize_subgraph方法
-        if processed_subgraph is not None:
-            desc = processed_subgraph
-        elif hasattr(self.graph_encoder, 'textualize_subgraph'):
-            desc = self.graph_encoder.textualize_subgraph(question_text)
-        else:
-            desc = ""
+        # 不再使用desc，因为multi_choice_prompt已包含推理路径
+        # 优化的提示词，更明确的指令
+        prompt = """You are a question-answering assistant. Your task is to provide the most accurate answer.
+
+CRITICAL RULES:
+1. If candidate answers with evidence are provided:
+   - Review the evidence (relevant facts) for each candidate
+   - If one candidate is strongly supported by its evidence, output that candidate EXACTLY as written
+   - Only reject all candidates if NONE have valid supporting evidence
+   
+2. If no candidates are provided OR all candidates are clearly wrong:
+   - Use your knowledge to provide a brief, factual answer
+   
+3. Output format:
+   - If selecting a candidate: copy it EXACTLY (including capitalization, punctuation)
+   - If providing your own: keep it concise (1-5 words typical)
+"""
         
-        # 构建完整的文本输入，按照流程.txt中的格式
-        # 格式：多选提示 + 图结构(CSV) + Question: + 问题
+        # 构建输入：候选答案已包含路径信息，不需要额外的子图描述
         if multi_choice_prompt:
-            full_text = f"多选提示：{multi_choice_prompt}\n图结构:{desc}\nQuestion:{question_text}"
+            # multi_choice_prompt已包含candidates和their relevant facts
+            full_text = f"{prompt}\n\nCandidates with supporting evidence:\n{multi_choice_prompt}\n\nQuestion: {question_text}\n\nAnswer:"
         else:
-            full_text = f"图结构:\n{desc}\nQuestion:\n{question_text}"
+            # 没有候选答案时的简单格式
+            full_text = f"{prompt}\n\nQuestion: {question_text}\n\nAnswer:"
+        
+        # # 调试输出（简化）
+        if multi_choice_prompt:
+            print(f"Question: {question_text}")
+            print(f"Candidates provided: Yes")
         
         # 获取Token Embedding
         inputs = self.tokenizer(
@@ -252,10 +343,10 @@ class GraphLLM(torch.nn.Module):
         questions = batch["question"]
         labels = batch["label"]
 
-        # 步骤1: GNN编码图结构（只获取h_g_pooled和子图）
-        h_g, _, processed_subgraph = self.encode_graphs(subs, qids, questions)
+        # 步骤1: GNN编码图结构（为每个问题生成独立子图）
+        h_g, _, subgraph_list = self.encode_graphs(subs, qids, questions, mode='llm_train')
 
-        # 步骤2: 生成文本向量h_t
+        # 步骤2: 生成文本向量h_t（每个问题使用自己的子图）
         h_t_list = []
         for i, question in enumerate(questions):
             # 从文件中读取多选提示
@@ -277,10 +368,13 @@ class GraphLLM(torch.nn.Module):
             
             multi_choice_prompt = self.load_multi_choice_prompt_from_file(relative_qid, filepath)
             
+            # 使用对应问题的子图
+            # current_subgraph = subgraph_list[i] if i < len(subgraph_list) else None
+            
             h_t = self.generate_text_vector(
                 question_text=question,
                 multi_choice_prompt=multi_choice_prompt,  # 使用从文件读取的多选提示
-                processed_subgraph=processed_subgraph  # 使用GNN生成的子图结构
+                # processed_subgraph=current_subgraph  # 使用该问题独立的子图结构
             )
             h_t_list.append(h_t)
         
@@ -308,7 +402,6 @@ class GraphLLM(torch.nn.Module):
         for i in range(batch_size):
             # h_t: [L, hidden] from generate_text_vector (textualized subgraph + prompts + question)
             h_t = h_t_list[i]
-
             # answer ids/embeds
             label_tokens      = self.tokenizer(labels[i], add_special_tokens=False)
             answer_input_ids  = label_tokens.input_ids[:self.max_new_tokens] + eos_tokens.input_ids
@@ -400,13 +493,11 @@ class GraphLLM(torch.nn.Module):
         qids = batch["qids"]
         questions = batch["question"]
 
-        # GNN编码
+        # GNN编码 - 使用encode_graphs方法为每个问题生成独立的子图
         self.graph_encoder.eval()  # 推理时设置为eval模式
-        results = self.graph_encoder(subs, qids, mode='llm_inference', question_texts=questions)
-        h_g_pooled,  processed_subgraph = results
-        h_g = self.h_g_projector(h_g_pooled)
+        h_g, _, subgraph_list = self.encode_graphs(subs, qids, questions, mode='llm_inference')
 
-        # 生成文本向量 h_t
+        # 生成文本向量 h_t（每个问题使用自己的子图）
         h_t_list = []
         for i, question in enumerate(questions):
             # 从文件中读取多选提示（以相对 qid 定位）
@@ -414,15 +505,20 @@ class GraphLLM(torch.nn.Module):
                 q_i = int(qids[i])
             except Exception:
                 q_i = qids[i]
+
             relative_qid = q_i - self.loader.n_train_qs - self.loader.n_valid_qs
             multi_choice_prompt = self.load_multi_choice_prompt_from_file(
-                relative_qid, 'webqsp-path.txt'
+                relative_qid, 'webqsp-test-path.txt'
             )
-
+            print(relative_qid,"multi_choice_prompt",multi_choice_prompt)
+            
+            # 使用对应问题的子图
+            current_subgraph = subgraph_list[i] if i < len(subgraph_list) else None
+            
             h_t = self.generate_text_vector(
                 question_text=question,
                 multi_choice_prompt=multi_choice_prompt,  # 使用从文件读取的多选提示
-                processed_subgraph=processed_subgraph  # 使用GNN生成的子图结构
+                processed_subgraph=current_subgraph  # 使用该问题独立的子图结构
             )
             h_t_list.append(h_t)
 
@@ -463,22 +559,24 @@ class GraphLLM(torch.nn.Module):
         attention_mask = torch.tensor(batch_attention_mask).to(self.model.device)
 
         with self.maybe_autocast():
+            # Disable use_cache when gradient checkpointing is enabled to avoid warning
+            use_cache = not self.model.config.use_cache if hasattr(self.model.config, 'gradient_checkpointing') and self.model.config.gradient_checkpointing else True
             outputs = self.model.generate(
                 inputs_embeds=inputs_embeds,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=512,
                 attention_mask=attention_mask,
-                use_cache=True,
+                use_cache=use_cache,  # Disable cache if gradient checkpointing is enabled
                 temperature=0,  # 匹配 example_chat_completion.py
                 top_p=0.9,
                 do_sample=False  # temperature=0 时不采样，确保确定性输出
             )
 
         pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
+        print(qids,'---',questions,pred)
         return {
             'pred': pred,
             'question': questions,
-            'qids': qids,  # 用于评分
+            'qids': qids,  # 用于评分. [3098]开始
         }
 
 
@@ -487,57 +585,6 @@ class GraphLLM(torch.nn.Module):
         """
         添加与example_chat_completion.py相同的评分机制
         """
-        import json
-        import numpy as np
-        from pathlib import Path
-        
-        # 导入check.py的评分逻辑
-        def candidate_path(root):
-            all_entities = []
-            all_scores = []
-            all_paths = []
-            all_ids = {}
-
-            with open(root, 'r') as file:
-                lines = file.readlines()
-
-            i = 0
-            for line in lines:
-                line = line.strip()
-                parts = line.split('\t')
-
-                entities = []
-                scores = []
-                paths = []
-
-                qid = int(parts[0])
-                parts = parts[1:]
-                for part in parts:
-                    if part == '':
-                        continue
-                    try:
-                        entity, score, path = part.split('|')
-                    except:
-                        print(part)
-                        continue
-                    entities.append(entity)
-                    scores.append(float(score))
-                    path = path.split(';')
-                    split_path = []
-                    for p in path:
-                        if 'self_loop' not in p and p != '' and p not in split_path:
-                            split_path.append(p)
-                    split_path = ', '.join(split_path)
-                    paths.append(split_path)
-
-                all_entities.append(entities)
-                all_scores.append(scores)
-                all_paths.append(paths)
-                all_ids[qid] = i
-                i += 1
-
-            return all_entities, all_scores, all_paths, all_ids
-        
         def check_accuracy(dataset, predictions, prediction_ids):
             # 设置文件路径
             if dataset.startswith('MetaQA'):
@@ -652,13 +699,11 @@ class GraphLLM(torch.nn.Module):
     def print_trainable_params(self):
         trainable_params = 0
         all_param = 0
-
         for _, param in self.named_parameters():
             num_params = param.numel()
             all_param += num_params
             if param.requires_grad:
                 trainable_params += num_params
-
         return trainable_params, all_param
     
     def load_pretrained_gnn(self, pretrained_path):
@@ -683,16 +728,13 @@ class GraphLLM(torch.nn.Module):
         print("Freezing GNN parameters...")
         frozen_params = 0
         total_gnn_params = 0
-        
         for name, param in self.graph_encoder.named_parameters():
             param.requires_grad = False
             frozen_params += param.numel()
             total_gnn_params += param.numel()
-        
         print(f"Frozen {frozen_params}/{total_gnn_params} GNN parameters")
-        
         # 确保投影层参数可训练
         for name, param in self.h_g_projector.named_parameters():
             param.requires_grad = True
-        for name, param in self.soft_prompt_projector.named_parameters():
-            param.requires_grad = True
+        # for name, param in self.soft_prompt_projector.named_parameters():
+        #     param.requires_grad = True
