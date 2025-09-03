@@ -8,6 +8,7 @@ from base_model import BaseModel
 parser = argparse.ArgumentParser(description="Parser for DualR")
 parser.add_argument('--dataset', type=str, default='MetaQA/1-hop')
 parser.add_argument('--load', action='store_true')
+parser.add_argument('--resume', action='store_true', help='Resume training from best saved model based on dataset name')
 parser.add_argument('--seed', type=str, default=1234)
 parser.add_argument('--K', type=int, default=50)
 parser.add_argument('--gpu', type=int, default=0)
@@ -142,7 +143,24 @@ if __name__ == '__main__':
 
     with open(opts.perf_file, 'a+') as f:
         f.write(config_str)
-    if args.load:
+    
+    # Resume training from automatically inferred checkpoint
+    if args.resume:
+        dataset_key = dataset.replace('/', '-')
+        checkpoint_path = f"{dataset_key}_best_saved_model.pt"
+        models_dir = 'models'
+        full_checkpoint_path = os.path.join(models_dir, checkpoint_path)
+        
+        if os.path.exists(full_checkpoint_path):
+            model.load_model(checkpoint_path)
+            print(f'Resumed training from: {checkpoint_path}')
+            with open(opts.perf_file, 'a+') as f:
+                f.write(f'[resume] {checkpoint_path}\n')
+        else:
+            print(f'Warning: Checkpoint {checkpoint_path} not found in {models_dir}/, starting fresh training')
+            with open(opts.perf_file, 'a+') as f:
+                f.write(f'[resume-failed] {checkpoint_path} not found, fresh start\n')
+    elif args.load:
         checkpoint = 'webqsp_best_saved_model.pt'
         model.load_model(checkpoint)
         model.get_path(mode='test',dataset='webqsp')
@@ -183,7 +201,7 @@ if __name__ == '__main__':
             
             # 为非WebCWQ数据集生成路径
             if dataset != 'WebCWQ':
-                model.get_path(mode='test', filepath=dataset_name + '-path.txt')
+                model.get_path(mode='test', dataset=args.dataset)
         
         # WebCWQ数据集的特殊处理
         if dataset == 'WebCWQ' and epoch == 19:

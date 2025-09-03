@@ -14,7 +14,7 @@ def main(
         max_seq_len: int = 512,
         max_batch_size: int = 8,
         max_gen_len: Optional[int] = None,
-        dataset: str = 'webqsp'
+        dataset: str = 'CWQ'
 ):
     device_id = 0
     torch.cuda.set_device(device_id)

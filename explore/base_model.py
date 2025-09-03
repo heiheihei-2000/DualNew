@@ -109,7 +109,7 @@ class BaseModel(object):
             end = min(n_data, (i + 1) * batch_size)
             batch_idx = np.arange(start, end)
             subs, rels, objs = self.loader.get_batch(batch_idx, data='valid')
-            _, _, scores, _, _, _ = self.model(subs, rels, mode='valid')
+            _, _, scores = self.model(subs, rels, mode='valid')
             scores = scores.data.cpu().numpy()
 
             filters = 0
@@ -129,7 +129,7 @@ class BaseModel(object):
             end = min(n_data, (i + 1) * batch_size)
             batch_idx = np.arange(start, end)
             subs, rels, objs = self.loader.get_batch(batch_idx, data='test')
-            _, _, scores, _, _, _ = self.model(subs, rels, mode='test')
+            _, _, scores= self.model(subs, rels, mode='test')
             scores = scores.data.cpu().numpy()
 
             filters = 0

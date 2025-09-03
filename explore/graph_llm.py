@@ -280,21 +280,37 @@ class GraphLLM(torch.nn.Module):
         多选提示 + 全局子图A文本化(CSV格式) + 问题 → LLM Token Embedding → h_t
         """
         # 不再使用desc，因为multi_choice_prompt已包含推理路径
-        # 优化的提示词，更明确的指令
-        prompt = """You are a question-answering assistant. Your task is to provide the most accurate answer.
+        # 优化的提示词：结构化决策框架，增强证据评估
+        prompt = """You are an expert Knowledge Graph Question Answering assistant. Your task is to select the most accurate answer from candidate entities or provide a fallback answer when necessary.
 
-CRITICAL RULES:
-1. If candidate answers with evidence are provided:
-   - Review the evidence (relevant facts) for each candidate
-   - If one candidate is strongly supported by its evidence, output that candidate EXACTLY as written
-   - Only reject all candidates if NONE have valid supporting evidence
-   
-2. If no candidates are provided OR all candidates are clearly wrong:
-   - Use your knowledge to provide a brief, factual answer
-   
-3. Output format:
-   - If selecting a candidate: copy it EXACTLY (including capitalization, punctuation)
-   - If providing your own: keep it concise (1-5 words typical)
+## DECISION FRAMEWORK
+
+### Step 1: Evidence Assessment
+For each candidate, evaluate:
+- Direct Relevance: Does evidence directly address the question?
+- Factual Support: Do graph facts logically support this answer?
+- Completeness: Does evidence sufficiently justify selection?
+
+### Step 2: Answer Selection
+
+SCENARIO A - Strong Candidate Exists:
+- Select candidate with STRONGEST evidence (direct relations > inferred connections)
+- OUTPUT: Copy selected candidate EXACTLY as provided
+
+SCENARIO B - Multiple Valid Candidates:
+- Compare evidence quality and directness
+- OUTPUT: List all valid candidates separated by semicolons (;)
+
+SCENARIO C - No Valid Candidates:
+- Generate concise factual answer (1-5 words)
+- OUTPUT: Entity names or specific facts only
+
+## CRITICAL RULES
+1. Exact Matching: Reproduce candidates EXACTLY - preserve all formatting
+2. Evidence Priority: Always prefer evidenced candidates over generating
+3. No Speculation: Only reject if evidence contradicts or is irrelevant
+4. Entity Format: Maintain knowledge graph format (e.g., underscores)
+5. No explanations in output - answer only
 """
         
         # 构建输入：候选答案已包含路径信息，不需要额外的子图描述
