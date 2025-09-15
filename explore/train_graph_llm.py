@@ -24,7 +24,7 @@ def parse_args_graph_llm():
     
     # Dataset and paths
     parser.add_argument('--dataset', type=str, default='webqsp', 
-                       choices=['webqsp', 'CWQ', 'MetaQA/1-hop', 'MetaQA/2-hop', 'MetaQA/3-hop'],
+                       choices=['webqsp', 'CWQ', 'WebCWQ', 'MetaQA/1-hop', 'MetaQA/2-hop', 'MetaQA/3-hop'],
                        help='Dataset name')
     parser.add_argument('--output_dir', type=str, default='./results', 
                        help='Output directory for results')
@@ -33,15 +33,19 @@ def parse_args_graph_llm():
     
     # Model parameters
     parser.add_argument('--llm_model_path', type=str, 
-                       default='meta-llama/Llama-2-7b-chat-hf',
+                       default='meta-llama/Llama-2-13b-chat-hf',
                        help='Path to LLM model')
-    parser.add_argument('--llm_frozen', type=str, default='False',
+    # Accept both --llm_frozen and the common misspelling --llmfrezon
+    parser.add_argument('--llm_frozen', '--llmfrezon', dest='llm_frozen', type=str, default='False',
                        choices=['True', 'False'],
-                       help='Whether to freeze LLM parameters')
+                       help='Whether to freeze LLM parameters (alias: --llmfrezon)')
     parser.add_argument('--pretrained_gnn_path', type=str, default=None,
                        help='Path to pretrained GNN model')
     parser.add_argument('--freeze_gnn', action='store_true',
                        help='Whether to freeze GNN parameters')
+    parser.add_argument('--use_graph_prompt', type=str, default='True',
+                       choices=['True', 'False'],
+                       help='Whether to use GNN soft prompt (h_g) in LLM input')
     
     # GNN parameters
     parser.add_argument('--hidden_dim', type=int, default=256,
@@ -101,6 +105,8 @@ def parse_args_graph_llm():
                        help='Disable tqdm progress bars to avoid buffering issues')
     parser.add_argument('--load', action='store_true',
                        help='Load pretrained weights from checkpoint to continue training')
+    parser.add_argument('--load_projector_only', action='store_true',
+                       help='Only load projector parameters, skip LLM parameters')
     
     return parser.parse_args()
 
@@ -133,28 +139,58 @@ def save_checkpoint(model, optimizer, epoch, args, is_best=False):
         'args': args
     }
     
+    dataset_name = args.dataset.replace('/', '-') if '/' in args.dataset else args.dataset
     if is_best:
-        path = os.path.join(args.checkpoint_dir, f'best_model_{args.dataset}.pth')
+        path = os.path.join(args.checkpoint_dir, f'best_model_{dataset_name}.pth')
     else:
-        path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch}_{args.dataset}.pth')
+        path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch}_{dataset_name}.pth')
     
     torch.save(checkpoint, path)
     print(f"Checkpoint saved to {path}")
 
+    # Convenience: when only training the projector, also dump its weights separately
+    try:
+        if getattr(args, 'llm_frozen', 'False') == 'True' and is_best:
+            proj_path = os.path.join(args.checkpoint_dir, f'best_projector_{dataset_name}.pth')
+            torch.save({'epoch': epoch, 'state_dict': model.h_g_projector.state_dict()}, proj_path)
+            print(f"Projector-only weights saved to {proj_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to save projector-only checkpoint: {e}")
+
 
 def load_best_model(model, args):
     dataset_name = args.dataset.replace('/', '-') if '/' in args.dataset else args.dataset
-    path = os.path.join(args.checkpoint_dir, f'best_model_{dataset_name}.pth')
+    # path = os.path.join(args.checkpoint_dir, f'best_model_{dataset_name}.pth')
+    path = os.path.join(args.checkpoint_dir, f'best_model_webqsp-old.pth')
+
     if os.path.exists(path):
         # 尽量使用 weights_only=True（新版本 PyTorch），不支持时回退
+        # 修复：使用正确的设备映射
+        device = torch.device(f'cuda:{args.gpu}' if args.gpu >= 0 and torch.cuda.is_available() else 'cpu')
         try:
-            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
         except TypeError:
-            checkpoint = torch.load(path, map_location='cpu')
+            checkpoint = torch.load(path, map_location=device)
 
         # 兼容两种保存格式：纯 state_dict 或 包含 'model_state_dict'
         state = checkpoint.get('model_state_dict', checkpoint)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        
+        # 如果只加载投影器参数
+        if hasattr(args, 'load_projector_only') and args.load_projector_only:
+            print("Loading projector parameters only (skipping LLM parameters)...")
+            # 只提取投影器相关的参数
+            projector_state = {k: v for k, v in state.items() if 'h_g_projector' in k}
+            if projector_state:
+                missing, unexpected = model.load_state_dict(projector_state, strict=False)
+                print(f"Loaded {len(projector_state)} projector parameters")
+            else:
+                print("Warning: No projector parameters found in checkpoint!")
+                missing = []
+                unexpected = []
+        else:
+            # 加载所有参数
+            missing, unexpected = model.load_state_dict(state, strict=False)
+        
         if missing or unexpected:
             print(f"[load_best_model] missing keys: {missing}, unexpected keys: {unexpected}")
 
@@ -172,18 +208,22 @@ import torch
 import json
 from tqdm import tqdm
 from math import ceil
-
+import os
+import sys
+from tqdm import tqdm
+import math
 def evaluate_model_batch(model, loader, args, data='test', eval_batch_size=None):
+
+
+
+
     """
     评估（按问题写出 <dataset>-ans.jsonl，随后调用 check.py 计算 HIT@1）：
     - tqdm 按“样本数”更新；
     - 仅收集 qid / question / 模型输出的文本 pred；
     - 写 ans.jsonl 时用“相对 qid”作为 id，且对同一相对 qid 去重（保留首次）。
     """
-    import os
-    import sys
-    from tqdm import tqdm
-    import math
+
 
     model.eval()
     batch_size = eval_batch_size if eval_batch_size is not None else args.n_tbatch
@@ -603,8 +643,9 @@ def main(args):
         opts.n_layer = 3
         opts.dropout = 0.1
         opts.act = 'idd'
-        opts.n_batch = args.batch_size # Start with batch size 1 to debug
-        opts.n_tbatch = 20
+        opts.n_batch = 1# Start with batch size 1 to debug
+        opts.n_tbatch = 2
+
         opts.K = 200
         loaders = [KGDataLoader(args.dataset)]
     elif dataset == 'CWQ':
@@ -620,6 +661,20 @@ def main(args):
         opts.n_tbatch = 20
         opts.K = 200
         loaders = [KGDataLoader(args.dataset)]
+    elif dataset == 'WebCWQ':  # Combined webqsp and CWQ
+        opts.lr = 0.0001
+        opts.decay_rate = 0.9968
+        opts.lamb = 0.00001
+        opts.hidden_dim = 256
+        opts.attn_dim = 5
+        opts.n_layer = 3
+        opts.dropout = 0.2
+        opts.act = 'idd'
+        opts.n_batch = 20
+        opts.n_tbatch = 20
+        opts.K = 200
+        # Load both webqsp_nsm and CWQ datasets
+        loaders = [KGDataLoader('webqsp_nsm'), KGDataLoader('CWQ')]
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
     
@@ -673,10 +728,24 @@ def main(args):
     batch_size = opts.n_batch
     eval_batch_size = opts.n_tbatch
     
+    # 处理 WebCWQ 数据集的多个 GNN 权重路径
+    if dataset == 'WebCWQ':
+        # WebCWQ 需要为不同数据集准备不同的 GNN 权重
+        pretrained_gnn_path = {
+            'webqsp': 'webqsp_best_saved_model.pt',  # WebQSP 对应的 GNN 权重
+            'cwq': 'CWQ_best_saved_model.pt'  # CWQ 对应的 GNN 权重（键名统一小写）
+        }
+        print("Using multiple GNN weights for WebCWQ:")
+        print(f"  webqsp: {pretrained_gnn_path['webqsp']}")
+        print(f"  cwq:    {pretrained_gnn_path['cwq']}")
+    else:
+        # 单个数据集使用单个 GNN 权重
+        pretrained_gnn_path = args.pretrained_gnn_path
+    
     model = GraphLLM(
         args=args, 
         loader=loader,
-        pretrained_gnn_path=args.pretrained_gnn_path,
+        pretrained_gnn_path=pretrained_gnn_path,
         freeze_gnn=args.freeze_gnn
     )
     # model.load_multi_choice_prompt_from_file()
@@ -690,7 +759,11 @@ def main(args):
     print(f"  Effective batch size: {batch_size * args.grad_steps}")
     
     # 设置优化器（与train.py保持一致）
-    params = [p for p in model.parameters() if p.requires_grad]
+    # 当 LLM 冻结时，仅训练 h_g_projector（满足“只训练 h_g_projector”的需求）
+    if str(args.llm_frozen) == 'True':
+        params = list(model.h_g_projector.parameters())
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=opts.lr, weight_decay=opts.lamb)
     
     # 设置学习率调度器（与train.py相同）
@@ -700,7 +773,11 @@ def main(args):
     # 如果需要加载预训练权重
     start_epoch = 0
     if args.load:
-        checkpoint_path = os.path.join('checkpoints/graph_llm', f'best_model_{args.dataset}.pth')
+        # Use args.checkpoint_dir to locate the best checkpoint for resuming
+        dataset_name = args.dataset.replace('/', '-') if '/' in args.dataset else args.dataset
+        # checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_{dataset_name}.pth')
+        checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_webqsp.pth')
+
         if os.path.exists(checkpoint_path):
             print(f"\nLoading pretrained weights from {checkpoint_path}...")
             try:
@@ -710,7 +787,22 @@ def main(args):
             
             # 加载模型状态
             model_state = checkpoint.get('model_state_dict', checkpoint)
-            missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+            
+            # 如果只加载投影器参数
+            if args.load_projector_only:
+                print("Loading projector parameters only (skipping LLM parameters)...")
+                # 只提取投影器相关的参数
+                projector_state = {k: v for k, v in model_state.items() if 'h_g_projector' in k}
+                if projector_state:
+                    missing_keys, unexpected_keys = model.load_state_dict(projector_state, strict=False)
+                    print(f"Loaded {len(projector_state)} projector parameters")
+                else:
+                    print("Warning: No projector parameters found in checkpoint!")
+                    missing_keys = []
+                    unexpected_keys = []
+            else:
+                # 加载所有参数
+                missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
             
             if missing_keys:
                 print(f"Missing keys when loading model: {missing_keys}")
@@ -737,16 +829,14 @@ def main(args):
         print("\nEval-only mode: Skipping training...")
         # 加载最佳模型
         print("Loading best model for evaluation...")
-        best_model_path = os.path.join(args.checkpoint_dir, f'best_model_{args.dataset}.pth')
-        if not os.path.exists(best_model_path):
-            raise FileNotFoundError(f"Best model not found at {best_model_path}. Please train the model first.")
+        # model = load_best_model(model, args)
         
         # 清理GPU内存
         torch.cuda.empty_cache()
         gc.collect()
         
         # 加载模型
-        # model = load_best_model(model, args)
+        model = load_best_model(model, args)
 
 
 
@@ -781,113 +871,198 @@ def main(args):
         return
     
     # 训练循环（与train.py的train_batch方法保持一致）
-    best_hit_rate = 0.0
+    best_train_loss = float('inf')
     best_epoch = 0
     
     for epoch in range(start_epoch, args.num_epochs):
-        # 打乱训练数据（与base_model.py的train_batch相同）
-        loader.shuffle_train()
-        
         # 训练阶段
         model.train()
         epoch_loss = 0.0
+        total_batches = 0
         
-        # 计算批次数（与base_model.py相同）
-        n_batch = loader.n_train // batch_size + (loader.n_train % batch_size > 0)
-        print(f'Epoch {epoch+1}, n_batch: {n_batch}')
-        
-        # 与MetaQA特殊处理保持一致
-        if 'MetaQA/2-hop' in loader.task_dir or 'MetaQA/3-hop' in loader.task_dir:
-            n_batch = n_batch // 10
-        
-        # 使用条件tqdm
-        iterator = range(n_batch)
-        if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
-            iterator = tqdm(iterator, desc="Training")
-        
-        # Gradient accumulation settings
-        accumulation_steps = args.grad_steps
-        optimizer.zero_grad()
-        accumulated_loss = 0.0
-        
-        for i in iterator:
-            start = i * batch_size
-            end = min(loader.n_train, (i + 1) * batch_size)
-            batch_idx = np.arange(start, end)
+        # 对于 WebCWQ，需要训练多个数据集
+        if dataset == 'WebCWQ' and len(loaders) > 1:
+            print(f'\nEpoch {epoch+1} - Training on multiple datasets (WebCWQ)')
             
-            # 使用get_batch获取数据（与base_model.py相同）
-            subs, qids, objs = loader.get_batch(batch_idx)
-            
-            # 转换为GraphLLM期望的格式
-            questions = []
-            labels = []
-            for j, q_id in enumerate(qids):
-                question_text = loader.id2question.get(q_id, f"question_{q_id}")
-                questions.append(question_text)
+            # 遍历每个 loader
+            for loader_idx, current_loader in enumerate(loaders):
+                # 更新模型中的 loader（这样 _split_info 能正确工作）
+                model.loader = current_loader
                 
-                # 处理答案 - train_data中每个样本已经是单个答案
-                answer_entity = objs[j]
-                # objs[j]应该是单个答案实体ID（因为train_data在read_web_qa中已经拆分）
-                answer_text = loader.id2entity.get(answer_entity, f"entity_{answer_entity}")
-                labels.append(answer_text)
-            
-            batch = {
-                'subs': subs.tolist() if isinstance(subs, np.ndarray) else subs,
-                'qids': qids.tolist() if isinstance(qids, np.ndarray) else qids,
-                'question': questions,
-                'label': labels
-            }
-            
-            # Forward pass and scale loss by accumulation steps
-            loss = model(batch)
-            loss = loss / accumulation_steps
-            loss.backward()
-            
-            accumulated_loss += loss.item()
-            
-            # Perform optimizer step every accumulation_steps iterations
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == n_batch:
-                # 梯度裁剪
-                clip_grad_norm_(params, max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                # 打乱训练数据
+                current_loader.shuffle_train()
                 
-                # Add accumulated loss to epoch loss (multiply back by accumulation_steps)
-                epoch_loss += accumulated_loss * accumulation_steps
+                # 计算批次数
+                n_batch = current_loader.n_train // batch_size + (current_loader.n_train % batch_size > 0)
+                
+                # MetaQA 特殊处理
+                if 'MetaQA/2-hop' in current_loader.task_dir or 'MetaQA/3-hop' in current_loader.task_dir:
+                    n_batch = n_batch // 10
+                
+                dataset_name = 'webqsp' if 'webqsp' in current_loader.task_dir.lower() else 'CWQ'
+                print(f'  Dataset {loader_idx+1}/{len(loaders)} ({dataset_name}): {n_batch} batches')
+                
+                # 使用条件tqdm
+                iterator = range(n_batch)
+                if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
+                    iterator = tqdm(iterator, desc=f"Training {dataset_name}")
+                
+                # Gradient accumulation settings
+                accumulation_steps = args.grad_steps
+                if loader_idx == 0:  # 只在第一个 loader 时清零梯度
+                    optimizer.zero_grad()
                 accumulated_loss = 0.0
+                
+                for i in iterator:
+                    start = i * batch_size
+                    end = min(current_loader.n_train, (i + 1) * batch_size)
+                    batch_idx = np.arange(start, end)
+                    
+                    # 使用get_batch获取数据
+                    subs, qids, objs = current_loader.get_batch(batch_idx)
+                    
+                    # 转换为GraphLLM期望的格式
+                    questions = []
+                    labels = []
+                    for j, q_id in enumerate(qids):
+                        question_text = current_loader.id2question.get(q_id, f"question_{q_id}")
+                        questions.append(question_text)
+                        
+                        # 处理答案
+                        answer_entity = objs[j]
+                        answer_text = current_loader.id2entity.get(answer_entity, f"entity_{answer_entity}")
+                        labels.append(answer_text)
+                    
+                    batch = {
+                        'subs': subs.tolist() if isinstance(subs, np.ndarray) else subs,
+                        'qids': qids.tolist() if isinstance(qids, np.ndarray) else qids,
+                        'question': questions,
+                        'label': labels
+                    }
+                    
+                    # Forward pass and scale loss by accumulation steps
+                    loss = model(batch)
+                    loss = loss / accumulation_steps
+                    loss.backward()
+                    
+                    accumulated_loss += loss.item()
+                    
+                    # Perform optimizer step every accumulation_steps iterations
+                    if (i + 1) % accumulation_steps == 0 or (i + 1) == n_batch:
+                        # 梯度裁剪
+                        clip_grad_norm_(params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        
+                        # Add accumulated loss to epoch loss
+                        epoch_loss += accumulated_loss * accumulation_steps
+                        accumulated_loss = 0.0
+                    
+                    # Update progress bar
+                    if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
+                        iterator.set_postfix({'loss': accumulated_loss * accumulation_steps})
+                    
+                    # 定期清理内存
+                    if (i + 1) % 10 == 0:
+                        torch.cuda.empty_cache()
+                
+                total_batches += n_batch
+        else:
+            # 单个数据集的原始逻辑
+            loader = loaders[0]
             
-            # Update progress bar with current accumulated loss
+            # 打乱训练数据
+            loader.shuffle_train()
+            
+            # 计算批次数
+            n_batch = loader.n_train // batch_size + (loader.n_train % batch_size > 0)
+            print(f'Epoch {epoch+1}, n_batch: {n_batch}')
+            
+            # MetaQA 特殊处理
+            if 'MetaQA/2-hop' in loader.task_dir or 'MetaQA/3-hop' in loader.task_dir:
+                n_batch = n_batch // 10
+            
+            # 使用条件tqdm
+            iterator = range(n_batch)
             if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
-                iterator.set_postfix({'loss': accumulated_loss * accumulation_steps})
+                iterator = tqdm(iterator, desc="Training")
             
-            # 定期清理内存
-            if (i + 1) % 10 == 0:
-                torch.cuda.empty_cache()
+            # Gradient accumulation settings
+            accumulation_steps = args.grad_steps
+            optimizer.zero_grad()
+            accumulated_loss = 0.0
+            
+            for i in iterator:
+                start = i * batch_size
+                end = min(loader.n_train, (i + 1) * batch_size)
+                batch_idx = np.arange(start, end)
+                
+                # 使用get_batch获取数据（与base_model.py相同）
+                subs, qids, objs = loader.get_batch(batch_idx)
+                
+                # 转换为GraphLLM期望的格式
+                questions = []
+                labels = []
+                for j, q_id in enumerate(qids):
+                    question_text = loader.id2question.get(q_id, f"question_{q_id}")
+                    questions.append(question_text)
+                    
+                    # 处理答案 - train_data中每个样本已经是单个答案
+                    answer_entity = objs[j]
+                    # objs[j]应该是单个答案实体ID（因为train_data在read_web_qa中已经拆分）
+                    answer_text = loader.id2entity.get(answer_entity, f"entity_{answer_entity}")
+                    labels.append(answer_text)
+                
+                batch = {
+                    'subs': subs.tolist() if isinstance(subs, np.ndarray) else subs,
+                    'qids': qids.tolist() if isinstance(qids, np.ndarray) else qids,
+                    'question': questions,
+                    'label': labels
+                }
+                
+                # Forward pass and scale loss by accumulation steps
+                loss = model(batch)
+                loss = loss / accumulation_steps
+                loss.backward()
+                
+                accumulated_loss += loss.item()
+                
+                # Perform optimizer step every accumulation_steps iterations
+                if (i + 1) % accumulation_steps == 0 or (i + 1) == n_batch:
+                    # 梯度裁剪
+                    clip_grad_norm_(params, max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    
+                    # Add accumulated loss to epoch loss (multiply back by accumulation_steps)
+                    epoch_loss += accumulated_loss * accumulation_steps
+                    accumulated_loss = 0.0
+                
+                # Update progress bar with current accumulated loss
+                if not hasattr(args, 'disable_tqdm') or not args.disable_tqdm:
+                    iterator.set_postfix({'loss': accumulated_loss * accumulation_steps})
+                
+                # 定期清理内存
+                if (i + 1) % 10 == 0:
+                    torch.cuda.empty_cache()
+            
+            total_batches = n_batch
         
         # 学习率衰减（与train.py相同）
         scheduler.step()
         
-        avg_train_loss = epoch_loss / n_batch
+        # 计算平均损失时使用总批次数
+        avg_train_loss = epoch_loss / total_batches if total_batches > 0 else epoch_loss
         print(f"Epoch {epoch+1}/{args.num_epochs} - Train Loss: {avg_train_loss:.4f}")
         
-        # 验证阶段 - 计算Hit率
-        print(f"Evaluating Hit Rate on validation set...")
-        val_hit_rate = evaluate_model_batch(model, loader, args, data='test', eval_batch_size=eval_batch_size)
-        print(f"Epoch {epoch+1}/{args.num_epochs} - Val Hit Rate: {val_hit_rate:.4f}%")
-        # # 记录日志
-        # if args.use_wandb:
-        #     wandb.log({
-        #         'Epoch': epoch + 1,
-        #         'Train Loss': avg_train_loss,
-        #         'Val Hit Rate': val_hit_rate
-        #     })
+        # 不再进行validation评估，直接基于训练损失保存模型
         
-        # 保存最佳模型（基于Hit率）
-        if val_hit_rate > best_hit_rate:
-            best_hit_rate = val_hit_rate
+        # 保存最佳模型（基于训练损失）
+        if avg_train_loss < best_train_loss:
+            best_train_loss = avg_train_loss
             best_epoch = epoch
             save_checkpoint(model, optimizer, epoch, args, is_best=True)
-            print(f"New best model saved! Val Hit Rate: {best_hit_rate:.4f}%")
+            print(f"New best model saved! Train Loss: {best_train_loss:.4f}")
         
         # 早停检查
         if epoch - best_epoch >= args.patience:
@@ -903,10 +1078,10 @@ def main(args):
         gc.collect()
     
     # 训练完成，清理资源
-    print(f"Training completed! Best Val Hit Rate: {best_hit_rate:.4f}% at epoch {best_epoch+1}")
+    print(f"Training completed! Best Train Loss: {best_train_loss:.4f} at epoch {best_epoch+1}")
     
     # if args.use_wandb:
-    #     wandb.log({'Best Val Hit Rate': best_hit_rate})
+    #     wandb.log({'Best Train Loss': best_train_loss})
     #     wandb.finish()
     
     # 清理内存

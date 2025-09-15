@@ -195,7 +195,7 @@ class Explore(torch.nn.Module):
         self.question_emb = self.load_qemb().detach().to(self.device)
         # self.W_q = nn.Linear(5120,self.hidden_dim)
         self.dim_reduct = nn.Sequential(
-            nn.Linear(4096, 2096),
+            nn.Linear(5120, 2096),
             nn.ReLU(),
             nn.Linear(2096, self.hidden_dim)
         ).to(self.device)  # Move to the correct device
@@ -375,13 +375,13 @@ class Explore(torch.nn.Module):
             q_valid = np.load('../embedding/Meta-3m-valid.npy')
             q_test = np.load('../embedding/Meta-3m-test.npy')
         elif 'webqsp' in datapath:
-            q_train = np.load('../embedding/webqsp-train.npy')
-            q_valid = np.load('../embedding/webqsp-valid.npy')
-            q_test = np.load('../embedding/webqsp-test.npy')
+            q_train = np.load('../embedding/13b-webqsp/webqsp-train.npy')
+            q_valid = np.load('../embedding/13b-webqsp/webqsp-valid.npy')
+            q_test = np.load('../embedding/13b-webqsp/webqsp-test.npy')
         elif 'CWQ' in datapath:
-            q_train = np.load('../embedding/CWQ-train.npy')
-            q_valid = np.load('../embedding/CWQ-valid.npy')
-            q_test = np.load('../embedding/CWQ-test.npy')
+            q_train = np.load('../embedding/13b-CWQ/CWQ-train.npy')
+            q_valid = np.load('../embedding/13b-CWQ/CWQ-valid.npy')
+            q_test = np.load('../embedding/13b-CWQ/CWQ-test.npy')
 
         q_emb = np.concatenate((q_train, q_valid, q_test))
 
@@ -393,9 +393,9 @@ class Explore(torch.nn.Module):
         if 'MetaQA' in datapath:
             rel_emb = np.load('../embedding/Meta-rel.npy')
         elif 'webqsp' in datapath:
-            rel_emb = np.load('../embedding/webqsp-rel.npy')
+            rel_emb = np.load('../embedding/13b-webqsp/webqsp-rel.npy')
         elif 'CWQ' in datapath:
-            rel_emb = np.load('../embedding/CWQ-rel.npy')
+            rel_emb = np.load('../embedding/13b-CWQ/CWQ-rel.npy')
 
         print('rel_emb shape: ', rel_emb.shape)
 

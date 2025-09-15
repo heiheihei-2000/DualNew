@@ -3,18 +3,35 @@ from utils_path import candidate_path
 import numpy as np
 import json
 
-def check(dataset):
+def check(dataset, data_type='test'):
+    """
+    Check model performance on test or validation set
+    Args:
+        dataset: 'webqsp', 'CWQ', or 'MetaQA*'
+        data_type: 'test' or 'valid' (default: 'test')
+    """
     # dataset = 'webqsp'
     if dataset.startswith('MetaQA'):
-        ta_file = '../data/'+ dataset + '/ntm/qa_test.txt'
+        if data_type == 'valid':
+            ta_file = '../data/'+ dataset + '/ntm/qa_dev.txt'
+        else:
+            ta_file = '../data/'+ dataset + '/ntm/qa_test.txt'
         dataset = dataset.replace('/','-')
-        path_file = '../explore/' + dataset + '-path.txt'
+        path_file = f'../explore/{dataset}-{data_type}-path.txt'
     elif dataset == 'webqsp':
-        ta_file = '../data/webqsp/Webqsp.txt'
-        path_file = '../explore/' + dataset + '-path.txt'
+        if data_type == 'valid':
+            ta_file = '../data/webqsp/Webqsp_valid.txt'  # Assuming validation file exists
+            path_file = '../explore/' + dataset + '-valid-path.txt'
+        else:
+            ta_file = '../data/webqsp/Webqsp.txt'
+            path_file = '../explore/' + dataset + '-test-path.txt'
     elif dataset == 'CWQ':
-        ta_file = '../data/CWQ/CWQ.txt'
-        path_file = '../explore/' + dataset + '-path.txt'
+        if data_type == 'valid':
+            ta_file = '../data/CWQ/CWQ_valid.txt'  # Assuming validation file exists
+            path_file = '../explore/' + dataset + '-valid-path.txt'
+        else:
+            ta_file = '../data/CWQ/CWQ.txt'
+            path_file = '../explore/' + dataset + '-test-path.txt'
 
     fta = open(ta_file)  # ta: true answer
     all_candi, all_score, all_p, all_ids = candidate_path(path_file)
@@ -34,7 +51,11 @@ def check(dataset):
             ta = 'null'
         all_ta.append(ta)
 
-    read_file = dataset + '-ans.jsonl'
+    # Use different answer file for validation set
+    if data_type == 'valid':
+        read_file = dataset + '-valid-ans.jsonl'
+    else:
+        read_file = dataset + '-ans.jsonl'
     fa = open(read_file)   
     all_a = []
     all_a_id = []
@@ -116,13 +137,36 @@ def check(dataset):
 
 
     hit1abc = np.array(check_abc).sum() / (len(check_abc) - n_null)
-    print('HIT@1: ', hit1abc)
+    print(f'[{data_type.upper()}] HIT@1: ', hit1abc)
     hit = n_true / (len(check) - n_null)
-    print('whether the correct answer is in the reply:' , hit)  
+    print(f'[{data_type.upper()}] whether the correct answer is in the reply:' , hit)  
 
-    fout = open('check-'+read_file,'w')
+    # Include data_type in output filename
+    output_file = f'check-{data_type}-{read_file}' if data_type == 'valid' else f'check-{read_file}'
+    fout = open(output_file,'w')
     for i in range(len(check)):
         data = {'id': all_a_id[i] , 'hit@1': check_abc[i], 'gold_answer': all_ta[all_a_id[i]], 'answer': all_a[i]}   
         fout.write(json.dumps(data) + '\n')
     fout.write(json.dumps({'HIT@1': hit1abc, 'HIT': hit})+ '\n')
     fout.close()
+
+
+if __name__ == '__main__':
+    import sys
+    
+    # Parse command line arguments
+    if len(sys.argv) < 2:
+        print("Usage: python check.py <dataset> [data_type]")
+        print("  dataset: webqsp, CWQ, or MetaQA")
+        print("  data_type: test (default) or valid")
+        sys.exit(1)
+    
+    dataset = sys.argv[1]
+    data_type = sys.argv[2] if len(sys.argv) > 2 else 'test'
+    
+    if data_type not in ['test', 'valid']:
+        print("Error: data_type must be 'test' or 'valid'")
+        sys.exit(1)
+    
+    print(f"Evaluating {dataset} on {data_type} set...")
+    check(dataset, data_type)
